@@ -20,96 +20,101 @@ const CSS = `
 @import url('https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600&family=Archivo+Narrow:wght@600;700&family=IBM+Plex+Mono:wght@500;600&display=swap');
 
 .mb-root {
-  --ground:#E4E5DC; --paper:#FFFDF8; --ink:#14201D; --soft:#5D6A65;
-  --rail:#123A38; --fire:#DD5F18; --fire-tint:#FBE7DA;
-  --ready:#2C7A52; --ready-tint:#DDEDE2; --line:#D2D2C5; --line-soft:#E7E7DD;
+  --ground:#F2F5EC; --paper:#FFFFFF; --ink:#182A20; --soft:#63756A;
+  --rail:#0F5C4E; --rail2:#1C8468; --fire:#FF6B3D; --fire-tint:#FFE7DA;
+  --ready:#2FAE6B; --ready-tint:#E1F5E7; --line:#E1E6DA; --line-soft:#EEF1E8;
+  --shadow:0 1px 2px rgba(24,42,32,.05), 0 10px 24px rgba(24,42,32,.08);
   font-family:'Archivo',ui-sans-serif,system-ui,sans-serif;
   color:var(--ink); background:var(--ground); min-height:100vh; -webkit-font-smoothing:antialiased;
 }
 .mb-root *,.mb-root *::before,.mb-root *::after{box-sizing:border-box;}
 .mb-root button{font:inherit;color:inherit;cursor:pointer;border:none;background:none;}
 .mb-root input,.mb-root select{font:inherit;color:inherit;}
-.mb-root :focus-visible{outline:2px solid var(--rail);outline-offset:2px;border-radius:3px;}
-.mb-shell{max-width:760px;margin:0 auto;padding:0 0 96px;}
+.mb-root :focus-visible{outline:2px solid var(--rail);outline-offset:2px;border-radius:4px;}
+.mb-shell{max-width:760px;margin:0 auto;padding:0 0 104px;}
 
-.mb-rail{position:sticky;top:0;z-index:30;background:var(--rail);color:#F2F0E6;padding:12px 16px 10px;}
+.mb-rail{position:sticky;top:0;z-index:30;background:linear-gradient(135deg,var(--rail),var(--rail2));color:#F2F0E6;padding:14px 18px 12px;border-radius:0 0 20px 20px;box-shadow:0 8px 20px rgba(10,40,32,.18);}
 .mb-rail-top{display:flex;align-items:baseline;gap:10px;}
-.mb-wordmark{font-family:'Archivo Narrow',sans-serif;font-weight:700;font-size:19px;letter-spacing:.14em;text-transform:uppercase;}
-.mb-rail-note{font-size:11px;color:#9FB6B2;margin-left:auto;font-family:'IBM Plex Mono',monospace;display:flex;align-items:center;gap:6px;}
+.mb-wordmark{font-family:'Archivo Narrow',sans-serif;font-weight:700;font-size:19px;letter-spacing:.1em;text-transform:uppercase;display:flex;align-items:center;gap:7px;}
+.mb-rail-note{font-size:11px;color:#B9E0D2;margin-left:auto;font-family:'IBM Plex Mono',monospace;display:flex;align-items:center;gap:6px;}
 .mb-led{width:7px;height:7px;border-radius:50%;background:#5E7C78;flex:none;}
-.mb-led.ok{background:#5FC08C;} .mb-led.busy{background:#E9A94B;} .mb-led.bad{background:#E2704F;} .mb-led.pending{background:#C9D36B;}
-.mb-scope{display:flex;gap:6px;margin-top:9px;}
-.mb-scope button{font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:.06em;text-transform:uppercase;padding:5px 10px;border-radius:999px;color:#A8C0BB;border:1px solid rgba(255,255,255,.18);}
+.mb-led.ok{background:#5FE0A0;} .mb-led.busy{background:#FFC15E;} .mb-led.bad{background:#FF7A63;} .mb-led.pending{background:#D8E56E;}
+.mb-scope{display:flex;gap:6px;margin-top:11px;}
+.mb-scope button{font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:.06em;text-transform:uppercase;padding:6px 12px;border-radius:999px;color:#BEE3D6;border:1px solid rgba(255,255,255,.22);transition:background .15s ease,color .15s ease;}
 .mb-scope button.on{background:#F2F0E6;color:var(--rail);border-color:#F2F0E6;font-weight:600;}
 
-.mb-view{padding:14px 14px 0;}
-.mb-h{font-family:'Archivo Narrow',sans-serif;font-weight:700;font-size:13px;letter-spacing:.14em;text-transform:uppercase;color:var(--soft);}
-.mb-card{background:var(--paper);border:1px solid var(--line);border-radius:10px;}
-.mb-empty{background:var(--paper);border:1px dashed var(--line);border-radius:10px;padding:22px 18px;text-align:center;}
-.mb-empty p{margin:0 0 14px;color:var(--soft);font-size:14px;line-height:1.5;}
-.mb-btn{background:var(--rail);color:#F2F0E6;border-radius:8px;padding:9px 14px;font-weight:600;font-size:14px;text-align:center;}
-.mb-btn.ghost{background:transparent;color:var(--rail);border:1px solid var(--line);}
-.mb-btn.danger{background:transparent;color:#9C3B22;border:1px solid #E3C6BC;}
-.mb-btn:disabled{opacity:.45;cursor:default;}
+.mb-view{padding:16px 14px 0;}
+.mb-h{font-family:'Archivo Narrow',sans-serif;font-weight:700;font-size:13px;letter-spacing:.12em;text-transform:uppercase;color:var(--soft);}
+.mb-card{background:var(--paper);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);}
+.mb-empty{background:var(--paper);border:1px solid var(--line);border-radius:16px;padding:28px 20px;text-align:center;box-shadow:var(--shadow);display:flex;flex-direction:column;align-items:center;}
+.mb-empty-ic{font-size:36px;line-height:1;margin-bottom:10px;}
+.mb-empty p{margin:0 0 16px;color:var(--soft);font-size:14px;line-height:1.55;max-width:38ch;}
+.mb-btn{background:var(--rail);color:#F2F0E6;border-radius:12px;padding:10px 16px;font-weight:600;font-size:14px;text-align:center;box-shadow:0 4px 12px rgba(15,92,78,.25);transition:transform .12s ease;}
+.mb-btn:active{transform:translateY(1px);}
+.mb-btn.ghost{background:transparent;color:var(--rail);border:1px solid var(--line);box-shadow:none;}
+.mb-btn.danger{background:transparent;color:#B03A1E;border:1px solid #F0C6B8;box-shadow:none;}
+.mb-btn:disabled{opacity:.45;cursor:default;box-shadow:none;}
 
-.mb-weekbar{display:flex;align-items:center;gap:8px;margin-bottom:12px;}
+.mb-weekbar{display:flex;align-items:center;gap:8px;margin-bottom:14px;}
 .mb-weekbar .lbl{font-family:'Archivo Narrow',sans-serif;font-weight:700;font-size:17px;flex:1;}
-.mb-step{width:34px;height:34px;border-radius:8px;border:1px solid var(--line);background:var(--paper);font-size:15px;line-height:1;}
-.mb-today{font-family:'IBM Plex Mono',monospace;font-size:11px;text-transform:uppercase;letter-spacing:.08em;border:1px solid var(--line);background:var(--paper);padding:8px 10px;border-radius:8px;}
+.mb-step{width:36px;height:36px;border-radius:11px;border:1px solid var(--line);background:var(--paper);font-size:15px;line-height:1;box-shadow:var(--shadow);}
+.mb-today{font-family:'IBM Plex Mono',monospace;font-size:11px;text-transform:uppercase;letter-spacing:.08em;border:1px solid var(--line);background:var(--paper);padding:9px 12px;border-radius:11px;box-shadow:var(--shadow);}
 
-.mb-day{margin-bottom:16px;}
-.mb-day-head{display:flex;align-items:center;gap:9px;padding:0 2px 7px;}
+.mb-day{margin-bottom:18px;}
+.mb-day-head{display:flex;align-items:center;gap:9px;padding:0 2px 8px;}
 .mb-day-date{font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--soft);}
 .mb-day-name{font-family:'Archivo Narrow',sans-serif;font-weight:700;font-size:15px;letter-spacing:.05em;text-transform:uppercase;}
 .mb-day.is-today .mb-day-name{color:var(--fire);}
 .mb-day-rule{flex:1;height:1px;background:var(--line);}
-.mb-add{font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--soft);border:1px solid var(--line);border-radius:999px;padding:3px 9px;background:var(--paper);}
+.mb-add{font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--soft);border:1px solid var(--line);border-radius:999px;padding:4px 11px;background:var(--paper);}
 .mb-add:hover{color:var(--rail);border-color:var(--rail);}
 .mb-day-none{font-size:13px;color:var(--soft);padding:2px 4px 4px;font-style:italic;}
 
-.mb-ticket{display:flex;background:var(--paper);border:1px solid var(--line);border-radius:10px;overflow:hidden;margin-bottom:8px;}
-.mb-stub{width:30px;flex:none;display:flex;align-items:center;justify-content:center;border-right:1px dashed var(--line);}
-.mb-stub span{font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.16em;text-transform:uppercase;writing-mode:vertical-rl;transform:rotate(180deg);}
-.mb-ticket.pending .mb-stub{background:var(--fire-tint);} .mb-ticket.pending .mb-stub span{color:#A9440E;}
-.mb-ticket.ready .mb-stub{background:var(--ready-tint);} .mb-ticket.ready .mb-stub span{color:#1F5C3C;}
-.mb-ticket.empty .mb-stub span{color:var(--soft);}
-.mb-ticket-body{flex:1;min-width:0;padding:10px 12px;}
+.mb-ticket{display:flex;background:var(--paper);border:1px solid var(--line);border-radius:14px;overflow:hidden;margin-bottom:9px;box-shadow:var(--shadow);}
+.mb-stub{width:44px;flex:none;display:flex;align-items:center;justify-content:center;border-right:1px dashed var(--line);}
+.mb-stub-ic{font-size:20px;line-height:1;}
+.mb-ticket.pending .mb-stub{background:var(--fire-tint);}
+.mb-ticket.ready .mb-stub{background:var(--ready-tint);}
+.mb-ticket.empty .mb-stub{background:var(--line-soft);}
+.mb-ticket-body{flex:1;min-width:0;padding:11px 13px;}
 .mb-ticket-row{display:flex;align-items:flex-start;gap:10px;}
 .mb-ticket-name{font-weight:600;font-size:15px;line-height:1.3;flex:1;min-width:0;text-align:left;word-break:break-word;}
-.mb-stamp{font-family:'IBM Plex Mono',monospace;font-size:10px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;padding:3px 7px;border-radius:4px;flex:none;margin-top:1px;}
+.mb-stamp{font-family:'IBM Plex Mono',monospace;font-size:10px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;padding:4px 8px;border-radius:999px;flex:none;margin-top:1px;}
 .mb-stamp.pending{background:var(--fire);color:#FFF6F0;}
 .mb-stamp.ready{background:var(--ready);color:#F1FAF4;}
 .mb-stamp.empty{background:var(--line-soft);color:var(--soft);}
-.mb-ticket-meta{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--soft);margin-top:5px;}
+.mb-ticket-meta{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--soft);margin-top:6px;}
 
-.mb-gauge{width:30px;height:30px;flex:none;border-radius:7px;border:1.5px solid var(--line);background:#fff;position:relative;overflow:hidden;}
+.mb-gauge{width:32px;height:32px;flex:none;border-radius:9px;border:1.5px solid var(--line);background:#fff;position:relative;overflow:hidden;}
 .mb-gauge i{position:absolute;left:0;right:0;bottom:0;background:var(--fire);transition:height .18s ease;}
 .mb-gauge.done{border-color:var(--ready);} .mb-gauge.done i{background:var(--ready);}
 .mb-gauge b{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:14px;color:#fff;font-weight:700;}
 .mb-gauge.todo{border-color:var(--fire);}
 
-.mb-group{margin-bottom:14px;}
-.mb-group-head{display:flex;align-items:center;gap:9px;padding:0 2px 6px;}
-.mb-row{background:var(--paper);border:1px solid var(--line);border-radius:10px;margin-bottom:7px;}
-.mb-row-main{display:flex;align-items:center;gap:11px;padding:9px 11px;}
+.mb-chip{width:34px;height:34px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:17px;flex:none;}
+
+.mb-group{margin-bottom:16px;}
+.mb-group-head{display:flex;align-items:center;gap:9px;padding:0 2px 7px;}
+.mb-row{background:var(--paper);border:1px solid var(--line);border-radius:13px;margin-bottom:8px;box-shadow:var(--shadow);}
+.mb-row-main{display:flex;align-items:center;gap:11px;padding:10px 12px;}
 .mb-row-text{flex:1;min-width:0;text-align:left;}
 .mb-row-name{font-weight:600;font-size:14.5px;line-height:1.25;word-break:break-word;}
 .mb-row-name.struck{color:var(--soft);text-decoration:line-through;text-decoration-color:var(--ready);}
 .mb-row-sub{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--soft);margin-top:3px;}
 .mb-stepper{display:flex;align-items:center;gap:1px;flex:none;}
-.mb-stepper button{width:30px;height:30px;border:1px solid var(--line);background:#fff;font-size:16px;line-height:1;color:var(--soft);}
-.mb-stepper button:first-child{border-radius:7px 0 0 7px;}
-.mb-stepper button:last-child{border-radius:0 7px 7px 0;}
+.mb-stepper button{width:32px;height:32px;border:1px solid var(--line);background:#fff;font-size:16px;line-height:1;color:var(--soft);}
+.mb-stepper button:first-child{border-radius:9px 0 0 9px;}
+.mb-stepper button:last-child{border-radius:0 9px 9px 0;}
 .mb-stepper button:disabled{opacity:.35;cursor:default;}
 
 .mb-disc{border-top:1px dashed var(--line);}
-.mb-disc-btn{width:100%;display:flex;align-items:center;gap:6px;padding:7px 11px;font-family:'IBM Plex Mono',monospace;font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--soft);}
+.mb-disc-btn{width:100%;display:flex;align-items:center;gap:6px;padding:8px 12px;font-family:'IBM Plex Mono',monospace;font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--soft);}
 .mb-disc-btn:hover{color:var(--rail);}
 .mb-caret{transition:transform .15s ease;font-size:9px;}
 .mb-caret.open{transform:rotate(90deg);}
-.mb-disc-body{padding:2px 11px 11px;}
+.mb-disc-body{padding:2px 12px 12px;}
 .mb-link-h{font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--soft);margin:8px 0 5px;}
-.mb-link{display:flex;align-items:center;gap:8px;width:100%;text-align:left;padding:6px 8px;border-radius:7px;background:#F6F5EE;border:1px solid var(--line-soft);margin-bottom:4px;font-size:13px;}
+.mb-link{display:flex;align-items:center;gap:8px;width:100%;text-align:left;padding:7px 9px;border-radius:9px;background:#F6F8F2;border:1px solid var(--line-soft);margin-bottom:4px;font-size:13px;}
 .mb-link:hover{border-color:var(--rail);}
 .mb-link .grow{flex:1;min-width:0;}
 .mb-dot{width:8px;height:8px;border-radius:50%;flex:none;}
@@ -119,70 +124,70 @@ const CSS = `
 .mb-none{font-size:12.5px;color:var(--soft);font-style:italic;padding:2px 0 4px;}
 
 .mb-flash{animation:mbflash 1.6s ease;}
-@keyframes mbflash{0%,55%{box-shadow:0 0 0 3px rgba(221,95,24,.35);}100%{box-shadow:0 0 0 0 rgba(221,95,24,0);}}
+@keyframes mbflash{0%,55%{box-shadow:0 0 0 3px rgba(255,107,61,.35);}100%{box-shadow:0 0 0 0 rgba(255,107,61,0);}}
 
-.mb-scrim{position:fixed;inset:0;background:rgba(18,32,29,.45);z-index:60;display:flex;align-items:flex-end;justify-content:center;}
-.mb-sheet{background:var(--ground);width:100%;max-width:760px;max-height:92vh;overflow-y:auto;border-radius:16px 16px 0 0;padding:16px 14px 26px;}
-.mb-sheet-head{display:flex;align-items:center;gap:10px;margin-bottom:14px;}
+.mb-scrim{position:fixed;inset:0;background:rgba(15,30,24,.5);z-index:60;display:flex;align-items:flex-end;justify-content:center;backdrop-filter:blur(2px);}
+.mb-sheet{background:var(--ground);width:100%;max-width:760px;max-height:92vh;overflow-y:auto;border-radius:22px 22px 0 0;padding:18px 16px 28px;box-shadow:0 -12px 40px rgba(10,30,24,.25);}
+.mb-sheet-head{display:flex;align-items:center;gap:10px;margin-bottom:16px;}
 .mb-sheet-title{font-family:'Archivo Narrow',sans-serif;font-weight:700;font-size:18px;letter-spacing:.06em;text-transform:uppercase;flex:1;}
-.mb-field{margin-bottom:12px;}
-.mb-label{display:block;font-family:'IBM Plex Mono',monospace;font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--soft);margin-bottom:5px;}
-.mb-input{width:100%;padding:10px 11px;border:1px solid var(--line);border-radius:8px;background:var(--paper);font-size:15px;}
+.mb-field{margin-bottom:13px;}
+.mb-label{display:block;font-family:'IBM Plex Mono',monospace;font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--soft);margin-bottom:6px;}
+.mb-input{width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:11px;background:var(--paper);font-size:15px;}
 .mb-input:focus{border-color:var(--rail);}
 .mb-seg{display:flex;gap:6px;}
-.mb-seg button{flex:1;padding:9px 4px;border:1px solid var(--line);border-radius:8px;background:var(--paper);font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--soft);}
+.mb-seg button{flex:1;padding:10px 4px;border:1px solid var(--line);border-radius:11px;background:var(--paper);font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--soft);}
 .mb-seg button.on{background:var(--rail);color:#F2F0E6;border-color:var(--rail);font-weight:600;}
 .mb-ac{position:relative;}
-.mb-ac-list{position:absolute;top:calc(100% + 4px);left:0;right:0;background:var(--paper);border:1px solid var(--line);border-radius:8px;z-index:5;max-height:190px;overflow-y:auto;box-shadow:0 8px 20px rgba(18,32,29,.14);}
-.mb-ac-list button{display:block;width:100%;text-align:left;padding:9px 11px;font-size:14px;border-bottom:1px solid var(--line-soft);}
+.mb-ac-list{position:absolute;top:calc(100% + 4px);left:0;right:0;background:var(--paper);border:1px solid var(--line);border-radius:11px;z-index:5;max-height:190px;overflow-y:auto;box-shadow:0 12px 28px rgba(18,32,29,.16);}
+.mb-ac-list button{display:block;width:100%;text-align:left;padding:10px 12px;font-size:14px;border-bottom:1px solid var(--line-soft);}
 .mb-ac-list button:last-child{border-bottom:none;}
-.mb-ac-list button:hover{background:#F1F0E7;}
+.mb-ac-list button:hover{background:#F1F4EC;}
 .mb-ac-list .new{color:var(--fire);font-weight:600;}
-.mb-ing-row{display:flex;align-items:center;gap:8px;background:var(--paper);border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin-bottom:6px;}
+.mb-ing-row{display:flex;align-items:center;gap:8px;background:var(--paper);border:1px solid var(--line);border-radius:11px;padding:9px 11px;margin-bottom:7px;}
 .mb-ing-row .nm{flex:1;min-width:0;font-size:14px;}
-.mb-qty{width:74px;padding:7px 8px;border:1px solid var(--line);border-radius:7px;text-align:right;font-family:'IBM Plex Mono',monospace;font-size:14px;background:#fff;}
+.mb-qty{width:74px;padding:7px 8px;border:1px solid var(--line);border-radius:8px;text-align:right;font-family:'IBM Plex Mono',monospace;font-size:14px;background:#fff;}
 .mb-unit{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--soft);width:34px;}
-.mb-x{width:28px;height:28px;border-radius:6px;color:var(--soft);font-size:16px;line-height:1;}
-.mb-sheet-actions{display:flex;gap:8px;margin-top:18px;}
+.mb-x{width:28px;height:28px;border-radius:8px;color:var(--soft);font-size:16px;line-height:1;}
+.mb-sheet-actions{display:flex;gap:8px;margin-top:20px;}
 .mb-sheet-actions .mb-btn{flex:1;}
 .mb-two{display:flex;gap:8px;} .mb-two > *{flex:1;}
 
-.mb-nav{position:fixed;bottom:0;left:0;right:0;z-index:40;background:var(--rail);display:flex;justify-content:center;padding-bottom:env(safe-area-inset-bottom);}
-.mb-nav-in{display:flex;width:100%;max-width:760px;}
-.mb-nav button{flex:1;padding:10px 2px 12px;color:#8FAAA5;display:flex;flex-direction:column;align-items:center;gap:3px;}
-.mb-nav button.on{color:#FFFDF8;}
-.mb-nav .ic{font-size:16px;line-height:1;}
+.mb-nav{position:fixed;left:0;right:0;bottom:calc(10px + env(safe-area-inset-bottom));z-index:40;display:flex;justify-content:center;padding:0 12px;pointer-events:none;}
+.mb-nav-in{pointer-events:auto;display:flex;width:100%;max-width:620px;background:linear-gradient(135deg,var(--rail),var(--rail2));border-radius:20px;padding:6px;box-shadow:0 14px 34px rgba(10,35,28,.32);}
+.mb-nav button{flex:1;padding:9px 2px 8px;border-radius:14px;color:#9FC9BA;display:flex;flex-direction:column;align-items:center;gap:3px;transition:background .15s ease,color .15s ease;}
+.mb-nav button.on{color:#FFFDF8;background:rgba(255,255,255,.14);}
+.mb-nav .ic{font-size:17px;line-height:1;}
 .mb-nav .tx{font-family:'IBM Plex Mono',monospace;font-size:9.5px;letter-spacing:.05em;text-transform:uppercase;}
 .mb-badge{position:absolute;transform:translate(14px,-4px);background:var(--fire);color:#fff;font-family:'IBM Plex Mono',monospace;font-size:9px;font-weight:600;border-radius:999px;padding:1px 5px;}
 .mb-navwrap{position:relative;display:flex;flex-direction:column;align-items:center;}
 
-.mb-sum{display:flex;gap:8px;margin-bottom:12px;}
-.mb-sum div{flex:1;background:var(--paper);border:1px solid var(--line);border-radius:9px;padding:8px 10px;}
+.mb-sum{display:flex;gap:8px;margin-bottom:14px;}
+.mb-sum div{flex:1;background:var(--paper);border:1px solid var(--line);border-radius:12px;padding:9px 11px;box-shadow:var(--shadow);}
 .mb-sum .n{font-family:'Archivo Narrow',sans-serif;font-weight:700;font-size:20px;line-height:1.1;}
 .mb-sum .l{font-family:'IBM Plex Mono',monospace;font-size:9.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--soft);margin-top:2px;}
 .mb-sum .fire .n{color:var(--fire);} .mb-sum .ready .n{color:var(--ready);}
 
 .mb-toggle{display:flex;align-items:center;gap:7px;font-family:'IBM Plex Mono',monospace;font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--soft);margin-left:auto;}
-.mb-search{width:100%;padding:9px 11px;border:1px solid var(--line);border-radius:8px;background:var(--paper);font-size:14px;margin-bottom:12px;}
+.mb-search{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:11px;background:var(--paper);font-size:14px;margin-bottom:13px;}
 
-.mb-panel{background:var(--paper);border:1px solid var(--line);border-radius:10px;padding:13px;margin-bottom:12px;}
+.mb-panel{background:var(--paper);border:1px solid var(--line);border-radius:14px;padding:14px;margin-bottom:13px;box-shadow:var(--shadow);}
 .mb-panel p{margin:0 0 10px;font-size:13.5px;line-height:1.55;color:var(--soft);}
 .mb-panel p:last-child{margin-bottom:0;}
 .mb-panel p strong{color:var(--ink);font-weight:600;}
 .mb-steps{margin:0 0 10px;padding-left:17px;font-size:13px;line-height:1.65;color:var(--soft);}
-.mb-steps code,.mb-panel code{font-family:'IBM Plex Mono',monospace;font-size:11.5px;background:#F1F0E7;padding:1px 5px;border-radius:4px;color:var(--ink);word-break:break-all;}
+.mb-steps code,.mb-panel code{font-family:'IBM Plex Mono',monospace;font-size:11.5px;background:#F1F4EC;padding:1px 5px;border-radius:5px;color:var(--ink);word-break:break-all;}
 .mb-kv{display:flex;justify-content:space-between;gap:12px;font-family:'IBM Plex Mono',monospace;font-size:11.5px;padding:5px 0;border-bottom:1px dashed var(--line-soft);}
 .mb-kv:last-child{border-bottom:none;}
 .mb-kv span:first-child{color:var(--soft);letter-spacing:.06em;text-transform:uppercase;font-size:10px;}
 .mb-kv span:last-child{text-align:right;word-break:break-all;}
-.mb-note{font-size:12.5px;line-height:1.55;padding:9px 11px;border-radius:8px;background:var(--fire-tint);color:#8C3A0C;border:1px solid #F0CDB4;margin-bottom:11px;}
-.mb-note.good{background:var(--ready-tint);color:#1F5C3C;border-color:#BEDCCB;}
+.mb-note{font-size:12.5px;line-height:1.55;padding:10px 12px;border-radius:11px;background:var(--fire-tint);color:#93400E;border:1px solid #F3D1BA;margin-bottom:12px;}
+.mb-note.good{background:var(--ready-tint);color:#1F5C3C;border-color:#BFE4CE;}
 .mb-files{display:flex;flex-wrap:wrap;gap:6px;}
-.mb-files button{font-family:'IBM Plex Mono',monospace;font-size:11px;border:1px solid var(--line);border-radius:7px;padding:6px 9px;background:#F6F5EE;}
+.mb-files button{font-family:'IBM Plex Mono',monospace;font-size:11px;border:1px solid var(--line);border-radius:9px;padding:7px 10px;background:#F6F8F2;}
 
 /* storage target picker */
-.mb-target{display:flex;gap:10px;align-items:flex-start;width:100%;text-align:left;padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--paper);margin-bottom:8px;}
-.mb-target.on{border-color:var(--rail);box-shadow:inset 0 0 0 1px var(--rail);}
+.mb-target{display:flex;gap:10px;align-items:flex-start;width:100%;text-align:left;padding:13px;border:1px solid var(--line);border-radius:13px;background:var(--paper);margin-bottom:9px;box-shadow:var(--shadow);}
+.mb-target.on{border-color:var(--rail);box-shadow:inset 0 0 0 1.5px var(--rail);}
 .mb-target .pip{width:16px;height:16px;border-radius:50%;border:1.5px solid var(--line);flex:none;margin-top:2px;position:relative;}
 .mb-target.on .pip{border-color:var(--rail);}
 .mb-target.on .pip::after{content:"";position:absolute;inset:3px;border-radius:50%;background:var(--rail);}
@@ -190,7 +195,7 @@ const CSS = `
 .mb-target span{font-size:12.5px;line-height:1.5;color:var(--soft);display:block;}
 
 /* reconcile */
-.mb-conflict{border:1px solid #F0CDB4;background:#FDF4EC;border-radius:9px;padding:10px 11px;margin-bottom:7px;}
+.mb-conflict{border:1px solid #F3D1BA;background:#FDF6EE;border-radius:12px;padding:11px 12px;margin-bottom:8px;}
 .mb-conflict .ttl{font-size:13.5px;font-weight:600;margin-bottom:6px;}
 .mb-conflict .side{display:flex;gap:8px;align-items:center;font-family:'IBM Plex Mono',monospace;font-size:11.5px;color:var(--soft);padding:2px 0;}
 .mb-conflict .side b{color:var(--ink);font-weight:600;min-width:52px;}
@@ -206,6 +211,15 @@ const CSS = `
 const CATEGORIES = ["Produce", "Meat & fish", "Dairy & eggs", "Bakery", "Pantry", "Frozen", "Drinks", "Household", "Other"];
 const UNITS = ["g", "kg", "ml", "L", "pcs", "tbsp", "tsp", "bunch", "pack", "can"];
 const KINDS = [{ id: "meal", label: "Meal" }, { id: "drink", label: "Drink" }, { id: "snack", label: "Snack" }];
+const KIND_ICONS = { meal: "🍲", drink: "🥤", snack: "🍿" };
+const CATEGORY_ICONS = {
+  "Produce": "🥬", "Meat & fish": "🐟", "Dairy & eggs": "🥚", "Bakery": "🍞",
+  "Pantry": "🥫", "Frozen": "🧊", "Drinks": "🥤", "Household": "🧴", "Other": "🍽️",
+};
+const CATEGORY_TINT = {
+  "Produce": "#E3F3D9", "Meat & fish": "#FBE1DD", "Dairy & eggs": "#FFF3CE", "Bakery": "#F7E6CF",
+  "Pantry": "#EDE3F5", "Frozen": "#DBF0F6", "Drinks": "#D8EEFB", "Household": "#E6E8F5", "Other": "#EAEAE0",
+};
 const DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
 const SCHEMA_VERSION = "1";
 const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
@@ -615,6 +629,14 @@ function Gauge({ bought, toBuy, onClick, label }) {
   );
 }
 
+function CatIcon({ category }) {
+  return (
+    <span className="mb-chip" style={{ background: CATEGORY_TINT[category] || CATEGORY_TINT.Other }} aria-hidden="true">
+      {CATEGORY_ICONS[category] || CATEGORY_ICONS.Other}
+    </span>
+  );
+}
+
 function Disclosure({ id, open, onToggle, label, children }) {
   return (
     <div className="mb-disc">
@@ -715,7 +737,7 @@ function EntrySheet({ ingredients, entryList, draft, onClose, onSave, onDelete }
         <div className="mb-two">
           <div className="mb-field">
             <label className="mb-label">Kind</label>
-            <div className="mb-seg">{KINDS.map((k) => <button key={k.id} className={kind === k.id ? "on" : ""} onClick={() => setKind(k.id)}>{k.label}</button>)}</div>
+            <div className="mb-seg">{KINDS.map((k) => <button key={k.id} className={kind === k.id ? "on" : ""} onClick={() => setKind(k.id)}>{KIND_ICONS[k.id]} {k.label}</button>)}</div>
           </div>
           <div className="mb-field">
             <label className="mb-label">Day</label>
@@ -806,6 +828,7 @@ function CalendarView({ ingredients, d, week, setWeek, open, toggle, goto, onNew
 
       {!hasEntries && (
         <div className="mb-empty" style={{ marginBottom: 16 }}>
+          <div className="mb-empty-ic">🥗</div>
           <p>Nothing planned yet. Add a meal to any day, or drop in a sample week to see the grocery list fill itself.</p>
           <button className="mb-btn" onClick={onSample}>Load a sample week</button>
         </div>
@@ -828,7 +851,7 @@ function CalendarView({ ingredients, d, week, setWeek, open, toggle, goto, onNew
               const ok = e.items.filter((it) => (d.covered[e.id + "|" + it.ingId] || 0) >= num(it.qty) - 1e-9).length;
               return (
                 <div key={e.id} className={"mb-ticket " + st} id={"node-entry-" + e.id}>
-                  <div className="mb-stub"><span>{e.kind}</span></div>
+                  <div className="mb-stub"><span className="mb-stub-ic" aria-hidden="true">{KIND_ICONS[e.kind] || "🍽️"}</span></div>
                   <div className="mb-ticket-body">
                     <div className="mb-ticket-row">
                       <button className="mb-ticket-name" onClick={() => onEdit(e)}>{e.name}</button>
@@ -876,7 +899,7 @@ function GroceryView({ ingredients, d, open, toggle, goto, setBought, scopeLabel
       </div>
 
       {ids.length === 0 ? (
-        <div className="mb-empty"><p>Nothing to buy for {scopeLabel.toLowerCase()}. Plan some meals, or check the fridge — you may already have it all.</p></div>
+        <div className="mb-empty"><div className="mb-empty-ic">✅</div><p>Nothing to buy for {scopeLabel.toLowerCase()}. Plan some meals, or check the fridge — you may already have it all.</p></div>
       ) : (
         <>
           <div className="mb-group-head">
@@ -888,7 +911,7 @@ function GroceryView({ ingredients, d, open, toggle, goto, setBought, scopeLabel
             if (!rows.length) return null;
             return (
               <div className="mb-group" key={cat}>
-                <div className="mb-group-head"><span className="mb-h">{cat}</span><span className="mb-day-rule" /></div>
+                <div className="mb-group-head"><span className="mb-h">{CATEGORY_ICONS[cat] || CATEGORY_ICONS.Other} {cat}</span><span className="mb-day-rule" /></div>
                 {rows.sort((a, b) => ingredients[a].name.localeCompare(ingredients[b].name)).map((id) => {
                   const ing = ingredients[id];
                   const b = d.bought[id] || 0, buy = d.toBuy[id], st = rowState(b, buy), step = stepFor(ing.unit);
@@ -945,6 +968,7 @@ function FridgeView({ ingredients, stock, d, open, toggle, goto, setFridge }) {
     return (
       <div className="mb-row" key={ing.id} id={"node-ing-" + ing.id}>
         <div className="mb-row-main">
+          <CatIcon category={ing.category} />
           <div className="mb-row-text">
             <div className="mb-row-name">{ing.name}</div>
             <div className="mb-row-sub">{have > 0 ? `${fmt(have)} ${ing.unit} at home` : "none at home"}{need > 0 ? ` · ${fmt(need)} ${ing.unit} planned` : ""}</div>
@@ -972,7 +996,7 @@ function FridgeView({ ingredients, stock, d, open, toggle, goto, setFridge }) {
 
   return (
     <div className="mb-view">
-      {all.length === 0 && <div className="mb-empty"><p>The fridge is empty because there are no ingredients yet. Add a meal first — its ingredients show up here.</p></div>}
+      {all.length === 0 && <div className="mb-empty"><div className="mb-empty-ic">🧊</div><p>The fridge is empty because there are no ingredients yet. Add a meal first — its ingredients show up here.</p></div>}
       {stocked.length > 0 && (
         <div className="mb-group">
           <div className="mb-group-head"><span className="mb-h">In the fridge</span><span className="mb-day-rule" /></div>
@@ -1024,11 +1048,11 @@ function IngredientsView({ ingredients, stock, entriesAll, d, open, toggle, goto
       )}
 
       <input className="mb-search" value={q} placeholder="Search…" onChange={(e) => setQ(e.target.value)} />
-      {all.length === 0 && <div className="mb-empty"><p>No ingredients yet. They collect here automatically as you build meals, and drive every autocomplete in the app.</p></div>}
+      {all.length === 0 && <div className="mb-empty"><div className="mb-empty-ic">🥕</div><p>No ingredients yet. They collect here automatically as you build meals, and drive every autocomplete in the app.</p></div>}
 
       {CATEGORIES.filter((c) => groups[c]).map((cat) => (
         <div className="mb-group" key={cat}>
-          <div className="mb-group-head"><span className="mb-h">{cat}</span><span className="mb-day-rule" /></div>
+          <div className="mb-group-head"><span className="mb-h">{CATEGORY_ICONS[cat] || CATEGORY_ICONS.Other} {cat}</span><span className="mb-day-rule" /></div>
           {groups[cat].map((ing) => {
             const users = d.usedBy[ing.id] || [], used = usage[ing.id] || 0;
             return (
@@ -1463,11 +1487,11 @@ export default function App() {
     : (adapterRef.current?.connected() ? (pending ? pending + " to commit" : "in sync") : "not connected");
 
   const NAV = [
-    { id: "calendar", ic: "▤", tx: "Calendar" },
-    { id: "groceries", ic: "✓", tx: "Groceries", badge: toBuyCount },
-    { id: "fridge", ic: "❄", tx: "Fridge" },
-    { id: "ingredients", ic: "≡", tx: "Items" },
-    { id: "storage", ic: "⚙", tx: "Storage", badge: conflicts.length },
+    { id: "calendar", ic: "🗓️", tx: "Calendar" },
+    { id: "groceries", ic: "🛒", tx: "Groceries", badge: toBuyCount },
+    { id: "fridge", ic: "🧊", tx: "Fridge" },
+    { id: "ingredients", ic: "📋", tx: "Items" },
+    { id: "storage", ic: "⚙️", tx: "Storage", badge: conflicts.length },
   ];
 
   return (
@@ -1476,7 +1500,7 @@ export default function App() {
       <div className="mb-shell">
         <header className="mb-rail">
           <div className="mb-rail-top">
-            <span className="mb-wordmark">Mealboard</span>
+            <span className="mb-wordmark"><span aria-hidden="true">🍲</span> Mealboard</span>
             <span className="mb-rail-note"><span className={"mb-led " + led} />{railNote}</span>
           </div>
           <div className="mb-scope">
