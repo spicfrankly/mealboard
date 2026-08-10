@@ -1,4 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
+import * as Y from "yjs";
+import { WebrtcProvider } from "y-webrtc";
 
 /* ==================================================================
    Mealboard
@@ -9,8 +11,9 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from "react"
      2. Cache        — localStorage (memory fallback when unavailable).
                        Written on every mutation. Survives reload and
                        carries the offline backlog.
-     3. Remote       — none | Google Drive CSV | any HTTP/WebDAV store.
-                       Only ever written through a reconcile.
+     3. Remote       — none | Google Drive CSV | any HTTP/WebDAV store |
+                       peers over WebRTC. Only ever written through a
+                       reconcile.
 
    Nothing is committed to a remote without a three-way reconcile
    against the baseline snapshot taken at the last successful sync.
@@ -363,6 +366,12 @@ const countRecords = (s) =>
   Object.values(s.entries).filter((r) => !r.deleted).length +
   Object.values(s.items).filter((r) => !r.deleted).length;
 
+const maxUpdatedAt = (s) => {
+  let t = 0;
+  COLLECTIONS.forEach((coll) => Object.values(s[coll] || {}).forEach((r) => { if (num(r.updatedAt) > t) t = num(r.updatedAt); }));
+  return t;
+};
+
 /* ================================================================== */
 /* Layer 2 — cache                                                    */
 /* ================================================================== */
@@ -650,8 +659,143 @@ function httpAdapter(cfg) {
   };
 }
 
+/* --- peer-to-peer: one Y.Doc, one Y.Map per table, keyed by the same
+       primary keys the CSVs use. The rows are the identical flat objects
+       every other adapter exchanges, so Yjs stays invisible above this
+       line: readTables hands the doc's contents to the usual reconcile,
+       writeTables puts the reconciled winner back. Yjs's own last-write-
+       wins is only ever the transport; updated_at still decides. --- */
+
+const P2P_KEYS = { stock: "ingredient_id", meta: "key" };
+const pkOf = (n) => P2P_KEYS[n] || "id";
+
+function docToTables(doc) {
+  const t = {};
+  for (const n of TABLE_NAMES) t[n] = Array.from(doc.getMap(n).values());
+  return t;
+}
+
+function tablesIntoDoc(doc, tables) {
+  doc.transact(() => {
+    for (const n of TABLE_NAMES) {
+      const m = doc.getMap(n), key = pkOf(n);
+      (tables[n] || []).forEach((row) => {
+        const id = row[key];
+        if (id == null || id === "") return;
+        if (!sameRecord(m.get(String(id)), row)) m.set(String(id), row);
+      });
+    }
+  });
+}
+
+/* SignalingConn sends the room name to the public signalling server in
+   clear, so the passphrase itself can never be the room name. */
+async function deriveRoomName(passphrase) {
+  const bytes = await crypto.subtle.digest("SHA-256", new TextEncoder().encode("mealboard-room-v1:" + passphrase));
+  return "mb-" + [...new Uint8Array(bytes)].map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 32);
+}
+
+const base64url = (bytes) => {
+  let s = "";
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+};
+
+const unbase64url = (s) => {
+  const b64 = String(s).replace(/-/g, "+").replace(/_/g, "/");
+  const bin = atob(b64 + "=".repeat((4 - (b64.length % 4)) % 4));
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+};
+
+/* Same PBKDF2 → AES-GCM shape y-webrtc uses for the room, deliberately a
+   different salt so the link key and the room key stay independent. */
+async function smsKey(passphrase) {
+  const km = await crypto.subtle.importKey("raw", new TextEncoder().encode(passphrase), "PBKDF2", false, ["deriveKey"]);
+  return crypto.subtle.deriveKey(
+    { name: "PBKDF2", salt: new TextEncoder().encode("mealboard-sms-v1"), iterations: 100000, hash: "SHA-256" },
+    km, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+}
+
+async function encodeSyncPayload(passphrase, update) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const cipher = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, await smsKey(passphrase), update));
+  const packed = new Uint8Array(iv.length + cipher.length);
+  packed.set(iv, 0);
+  packed.set(cipher, iv.length);
+  return base64url(packed);
+}
+
+async function decodeSyncPayload(passphrase, payload) {
+  const packed = unbase64url(payload);
+  if (packed.length <= 12) throw new Error("This update link is truncated or damaged");
+  return new Uint8Array(await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: packed.slice(0, 12) }, await smsKey(passphrase), packed.slice(12)));
+}
+
+/* The link carries the whole doc, not a diff: applying it is idempotent
+   and order-independent, so nothing has to track what a contact already
+   received — which a text message could never tell us anyway. It is built
+   from live state rather than the adapter's doc so it always matches what
+   the sender can see on screen, connected or not. */
+async function buildSyncLink(passphrase, state) {
+  const doc = new Y.Doc();
+  tablesIntoDoc(doc, stateToTables(state));
+  const payload = await encodeSyncPayload(passphrase, Y.encodeStateAsUpdate(doc));
+  doc.destroy();
+  const loc = window.location;
+  return loc.origin + loc.pathname + "?sync=" + payload;
+}
+
+async function decodeSyncState(passphrase, payload) {
+  const doc = new Y.Doc();
+  Y.applyUpdate(doc, await decodeSyncPayload(passphrase, payload));
+  const s = tablesToState(docToTables(doc));
+  doc.destroy();
+  return s;
+}
+
+function p2pAdapter(cfg) {
+  const st = { doc: null, provider: null, peers: 0 };
+
+  const teardown = () => {
+    st.provider?.destroy();
+    st.doc?.destroy();
+    st.provider = null; st.doc = null; st.peers = 0;
+  };
+
+  return {
+    id: "p2p",
+    needsConnect: true,
+    connected: () => !!st.provider,
+    describe: () => (!cfg.p2pPassphrase ? "no passphrase set" : !st.provider ? "not started" : st.peers > 0 ? st.peers + " peer" + (st.peers === 1 ? "" : "s") + " online" : "waiting for peers"),
+    state: st,
+
+    async connect() {
+      if (!cfg.p2pPassphrase) throw new Error("Set a shared passphrase first");
+      teardown();
+      const roomName = await deriveRoomName(cfg.p2pPassphrase);
+      st.doc = new Y.Doc();
+      const provider = new WebrtcProvider(roomName, st.doc, { password: cfg.p2pPassphrase });
+      st.provider = provider;
+      provider.awareness.on("change", () => { st.peers = Math.max(0, provider.awareness.getStates().size - 1); });
+      return roomName;
+    },
+
+    disconnect() { teardown(); },
+
+    async readTables() { return docToTables(st.doc); },
+
+    async writeTables(tables) { tablesIntoDoc(st.doc, tables); },
+  };
+}
+
 const buildAdapter = (cfg) =>
-  cfg.target === "drive" ? driveAdapter(cfg) : cfg.target === "http" ? httpAdapter(cfg) : localAdapter();
+  cfg.target === "drive" ? driveAdapter(cfg)
+    : cfg.target === "http" ? httpAdapter(cfg)
+      : cfg.target === "p2p" ? p2pAdapter(cfg)
+        : localAdapter();
 
 /* ================================================================== */
 /* Derivation                                                         */
@@ -1167,11 +1311,19 @@ function IngredientsView({ ingredients, stock, entriesAll, d, open, toggle, goto
 /* Storage view                                                       */
 /* ================================================================== */
 
-function StorageView({ config, setConfig, adapter, sync, state, pending, conflicts, error, onConnect, onDisconnect, onJoinDrive, onLeaveDrive, onSync, onShare, onWipeCache }) {
+function StorageView({ config, setConfig, adapter, sync, state, pending, conflicts, error, p2pPeers, syncLink, onConnect, onDisconnect, onJoinDrive, onLeaveDrive, onSync, onShare, onWipeCache }) {
   const [draft, setDraft] = useState(config);
   useEffect(() => setDraft(config), [config]);
+  const [newContact, setNewContact] = useState({ name: "", phone: "" });
+  const [copied, setCopied] = useState("");
   const origin = typeof window !== "undefined" ? window.location.origin : "";
   const apply = (patch) => setConfig({ ...config, ...patch });
+
+  const contacts = config.p2pContacts || [];
+  const lastEdit = maxUpdatedAt(state);
+  const patchContacts = (fn) => apply({ p2pContacts: fn(contacts) });
+  const markSent = (id) => patchContacts((cs) => cs.map((c) => (c.id === id ? { ...c, lastSentAt: now() } : c)));
+  const smsHref = (phone) => `sms:${phone}?body=${encodeURIComponent("Mealboard plan update — open this to merge it: " + syncLink)}`;
 
   const download = (t) => {
     const csv = toCSV(TABLES[t].cols, stateToTables(state)[t]);
@@ -1211,6 +1363,7 @@ function StorageView({ config, setConfig, adapter, sync, state, pending, conflic
       <Target id="local" title="This device only" blurb="Cache is the source of truth. No account, no network, nothing leaves the browser. Clearing site data erases the plan — export the CSVs to keep a copy." />
       <Target id="drive" title="Google Drive" blurb="A folder of CSVs in Drive, using the drive.file scope. Create your own folder, or join one someone shared with you, to collaborate from anywhere." />
       <Target id="http" title="Self-hosted" blurb="Any endpoint that answers GET and PUT per file — the bundled data server, Nextcloud WebDAV, or your own. Nothing touches Google." />
+      <Target id="p2p" title="Peer-to-peer" blurb="Syncs directly with collaborators over WebRTC when you're both online, and via a text-message link when you're not. No account, no server — just a shared passphrase." />
 
       {error && <div className="mb-note" style={{ marginTop: 12 }}>{error}</div>}
 
@@ -1299,6 +1452,77 @@ function StorageView({ config, setConfig, adapter, sync, state, pending, conflic
         </div>
       )}
 
+      {config.target === "p2p" && (
+        <>
+          <div className="mb-panel">
+            <div className="mb-group-head"><span className="mb-h">Shared passphrase</span><span className="mb-day-rule" /></div>
+            <div className="mb-field">
+              <label className="mb-label">Passphrase</label>
+              <input className="mb-input" type="password" placeholder="three or four uncommon words"
+                value={draft.p2pPassphrase || ""}
+                onChange={(e) => setDraft({ ...draft, p2pPassphrase: e.target.value })}
+                onBlur={() => apply({ p2pPassphrase: (draft.p2pPassphrase || "").trim() })} />
+            </div>
+            <div className="mb-note">
+              This passphrase is the whole security boundary. Everyone typing exactly the same words lands in the same room and can read and change the plan; anyone else cannot reach it at all. Pick something long, share it in person or over a channel you trust, and never through the same text message as a link.
+            </div>
+            <div className="mb-two">
+              {adapter.connected()
+                ? <button className="mb-btn ghost" onClick={onDisconnect}>Stop</button>
+                : <button className="mb-btn" disabled={!config.p2pPassphrase} onClick={onConnect}>Start</button>}
+              <button className="mb-btn ghost" disabled={!adapter.connected()} onClick={onSync}>Sync now</button>
+            </div>
+            <div style={{ marginTop: 12 }}>
+              <div className="mb-kv"><span>Room</span><span>{adapter.describe()}</span></div>
+              <div className="mb-kv"><span>Peers online</span><span>{adapter.connected() ? p2pPeers : "—"}</span></div>
+              <div className="mb-kv"><span>Update link</span><span>{syncLink ? Math.round(syncLink.length / 102.4) / 10 + " kB" : "—"}</span></div>
+            </div>
+            <div className="mb-note" style={{ marginTop: 12, marginBottom: 0 }}>
+              Peers find each other through a public signalling relay, which only ever sees a one-way hash of the passphrase — never the words, never the plan. The plan itself travels straight between browsers.
+            </div>
+          </div>
+
+          <div className="mb-panel">
+            <div className="mb-group-head"><span className="mb-h">Text-message contacts</span><span className="mb-day-rule" /></div>
+            <p>When nobody is online at the same time, send the plan as a link. It carries the whole plan encrypted with the same passphrase, and opening it twice changes nothing.</p>
+            {contacts.length === 0 && <div className="mb-none">Nobody added yet.</div>}
+            {contacts.map((c) => (
+              <div className="mb-row" key={c.id}>
+                <div className="mb-row-main">
+                  <div className="mb-row-text">
+                    <div className="mb-row-name">{c.name || c.phone}</div>
+                    <div className="mb-row-sub">{c.phone} · last sent {clock(c.lastSentAt)}</div>
+                  </div>
+                  {lastEdit > (c.lastSentAt || 0) && <span className="mb-pill">unsent</span>}
+                  <button className="mb-x" onClick={() => patchContacts((cs) => cs.filter((x) => x.id !== c.id))} aria-label={"Remove " + (c.name || c.phone)}>✕</button>
+                </div>
+                <div className="mb-two" style={{ padding: "0 11px 11px" }}>
+                  <a className="mb-btn ghost" style={{ textDecoration: "none", opacity: syncLink ? 1 : 0.45, pointerEvents: syncLink ? "auto" : "none" }}
+                    href={syncLink ? smsHref(c.phone) : undefined} onClick={() => markSent(c.id)}>Text update</a>
+                  <button className="mb-btn ghost" disabled={!syncLink} onClick={() => {
+                    navigator.clipboard?.writeText(syncLink);
+                    setCopied(c.id); markSent(c.id);
+                    setTimeout(() => setCopied(""), 1500);
+                  }}>{copied === c.id ? "Copied" : "Copy link"}</button>
+                </div>
+              </div>
+            ))}
+            <div className="mb-two" style={{ marginTop: 10 }}>
+              <input className="mb-input" placeholder="Name" value={newContact.name} onChange={(e) => setNewContact({ ...newContact, name: e.target.value })} />
+              <input className="mb-input" type="tel" placeholder="+15550100" value={newContact.phone} onChange={(e) => setNewContact({ ...newContact, phone: e.target.value })} />
+            </div>
+            <button className="mb-btn ghost" style={{ width: "100%", marginTop: 8 }} disabled={!newContact.phone.trim()}
+              onClick={() => {
+                patchContacts((cs) => [...cs, { id: uid(), name: newContact.name.trim(), phone: newContact.phone.trim(), lastSentAt: 0 }]);
+                setNewContact({ name: "", phone: "" });
+              }}>Add contact</button>
+            <div className="mb-note" style={{ marginTop: 12, marginBottom: 0 }}>
+              “Unsent” only means the plan changed since you last tapped Send for that person — it is a reminder, not a delivery receipt. Long plans make long links, and some phones shorten a message that runs past their limit; if a link will not open, use <strong>Copy link</strong> and paste it into a chat app instead.
+            </div>
+          </div>
+        </>
+      )}
+
       <div className="mb-group-head"><span className="mb-h">Sync</span><span className="mb-day-rule" /></div>
       <div className="mb-panel">
         <div className="mb-kv"><span>Source</span><span>{adapter.describe()}</span></div>
@@ -1370,7 +1594,7 @@ function sampleState(base) {
 /* App                                                                */
 /* ================================================================== */
 
-const defaultConfig = { target: "local", clientId: "", pickerApiKey: "", folderName: "Mealboard", driveFolderId: "", httpBase: "", httpToken: "", httpUser: "", httpPass: "", autoSync: true };
+const defaultConfig = { target: "local", clientId: "", pickerApiKey: "", folderName: "Mealboard", driveFolderId: "", httpBase: "", httpToken: "", httpUser: "", httpPass: "", p2pPassphrase: "", p2pContacts: [], autoSync: true };
 
 export default function App() {
   /* Layer 1 — the live copy. Seeded synchronously from layer 2. */
@@ -1398,7 +1622,7 @@ export default function App() {
   const setConfig = (next) => {
     setConfigState(next);
     cache.set(CONF_KEY, JSON.stringify(next));
-    if (next.target !== config.target || next.clientId !== config.clientId || next.httpBase !== config.httpBase) {
+    if (next.target !== config.target || next.clientId !== config.clientId || next.httpBase !== config.httpBase || next.p2pPassphrase !== config.p2pPassphrase) {
       adapterRef.current?.disconnect?.();
       adapterRef.current = buildAdapter(next);
       setSync({ status: "idle", at: 0 });
@@ -1417,6 +1641,22 @@ export default function App() {
   }, []);
 
   const pending = useMemo(() => pendingCount(baseline.current, state), [state, sync.at]);
+
+  /* The tail of every reconcile. `advanceBaseline` is false for an update
+     that arrived outside the configured data source (a ?sync= link): the
+     records it brought are new to that source, so they have to keep
+     counting as local changes until a real sync pushes them there. */
+  const commitReconciled = useCallback((r, advanceBaseline) => {
+    if (advanceBaseline) {
+      baseline.current = clone(r.merged);
+      writeCachedState(BASE_KEY, baseline.current);
+    }
+    writeCachedState(CACHE_KEY, r.merged);
+    setState(r.merged);
+    setConflicts(r.conflicts);
+    setSync({ status: "ok", at: now() });
+    setError("");
+  }, []);
 
   /* Layer 3 — reconcile, then commit. Never a blind overwrite. */
   const runSync = useCallback(async (silent) => {
@@ -1437,20 +1677,14 @@ export default function App() {
 
       if (r.fromLocal > 0 || r.conflicts.length > 0) await ad.writeTables(stateToTables(r.merged));
 
-      baseline.current = clone(r.merged);
-      writeCachedState(BASE_KEY, baseline.current);
-      writeCachedState(CACHE_KEY, r.merged);
-      setState(r.merged);
-      setConflicts(r.conflicts);
-      setSync({ status: "ok", at: now() });
-      setError("");
+      commitReconciled(r, true);
     } catch (e) {
       setSync((s) => ({ ...s, status: "bad" }));
       if (!silent) setError(e.message || String(e));
     } finally {
       busy.current = false;
     }
-  }, []);
+  }, [commitReconciled]);
 
   /* auto-reconcile */
   useEffect(() => {
@@ -1466,11 +1700,89 @@ export default function App() {
     return () => clearTimeout(t);
   }, [state, config.autoSync, runSync]);
 
+  /* --- peer-to-peer: live peers, the outgoing link, the incoming one --- */
+  const [p2pPeers, setP2pPeers] = useState(0);
+  const [syncLink, setSyncLink] = useState("");
+  const [inbound, setInbound] = useState("");
+
+  const contacts = config.p2pContacts || [];
+  const lastEdit = useMemo(() => maxUpdatedAt(state), [state]);
+  const unsent = useMemo(() => contacts.filter((c) => lastEdit > (c.lastSentAt || 0)), [contacts, lastEdit]);
+  const nudge = config.target === "p2p" && unsent.length > 0;
+
+  /* The adapter mutates its peer count outside React; poll rather than
+     invent an event contract for one target. */
+  useEffect(() => {
+    if (config.target !== "p2p") { setP2pPeers(0); return; }
+    const t = setInterval(() => setP2pPeers(adapterRef.current?.state?.peers ?? 0), 2000);
+    return () => clearInterval(t);
+  }, [config.target]);
+
+  /* Every link is a whole encrypted snapshot, so it is rebuilt whenever the
+     plan changes — debounced, and only while someone is there to send it to. */
+  useEffect(() => {
+    if (config.target !== "p2p" || !config.p2pPassphrase || contacts.length === 0) { setSyncLink(""); return; }
+    let live = true;
+    const t = setTimeout(() => {
+      buildSyncLink(config.p2pPassphrase, stateRef.current)
+        .then((u) => { if (live) setSyncLink(u); })
+        .catch(() => { if (live) setSyncLink(""); });
+    }, 800);
+    return () => { live = false; clearTimeout(t); };
+  }, [config.target, config.p2pPassphrase, contacts.length, state]);
+
+  useEffect(() => {
+    if (!nudge) return;
+    const h = (e) => { e.preventDefault(); e.returnValue = ""; };
+    window.addEventListener("beforeunload", h);
+    return () => window.removeEventListener("beforeunload", h);
+  }, [nudge]);
+
+  useEffect(() => {
+    const payload = new URLSearchParams(window.location.search).get("sync");
+    if (payload) setInbound(payload);
+  }, []);
+
+  /* An inbound link is just one more remote snapshot — reconciled, never
+     applied blind. The query param stays in the address bar until it has
+     actually been applied, so a recipient who has not set the passphrase
+     yet does not lose the update by opening it. */
+  useEffect(() => {
+    if (!inbound) return;
+    if (!config.p2pPassphrase) {
+      setView("storage");
+      setError("This link carries a shared plan update. Pick Peer-to-peer below and enter the passphrase it was encrypted with — the update is applied as soon as it matches.");
+      return;
+    }
+    let live = true;
+    (async () => {
+      try {
+        const remote = await decodeSyncState(config.p2pPassphrase, inbound);
+        if (!live) return;
+        commitReconciled(reconcile(baseline.current, clone(stateRef.current), remote), false);
+        setInbound("");
+        window.history.replaceState(null, "", window.location.pathname + window.location.hash);
+      } catch {
+        if (!live) return;
+        setView("storage");
+        setError("That update link could not be opened. Check the passphrase matches the sender's exactly, and that the whole link arrived unbroken.");
+      }
+    })();
+    return () => { live = false; };
+  }, [inbound, config.target, config.p2pPassphrase, commitReconciled]);
+
   const connect = async () => {
     setError(""); setSync((s) => ({ ...s, status: "busy" }));
     try {
+      adapterRef.current?.disconnect?.();
       adapterRef.current = buildAdapter(config);
       await adapterRef.current.connect();
+      /* A stale baseline equal to local state makes every existing record
+         look "deleted on the remote" against a source that has never seen
+         it, and reconcile would drop the lot. An empty baseline makes them
+         local changes, which is what a first connect actually is. */
+      baseline.current = emptyState();
+      writeCachedState(BASE_KEY, baseline.current);
       await runSync(false);
     } catch (e) {
       setSync((s) => ({ ...s, status: "bad" }));
@@ -1623,6 +1935,17 @@ export default function App() {
           </div>
         </header>
 
+        {nudge && view !== "storage" && (
+          <div className="mb-view">
+            <div className="mb-note" style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 0 }}>
+              <span style={{ flex: 1 }}>
+                {unsent.length} contact{unsent.length === 1 ? " hasn't" : "s haven't"} had your latest changes by text yet.
+              </span>
+              <button className="mb-btn ghost" style={{ padding: "6px 12px", fontSize: 12.5, flex: "none" }} onClick={() => setView("storage")}>Send now</button>
+            </div>
+          </div>
+        )}
+
         {view === "calendar" && (
           <CalendarView ingredients={ingredients} d={d} week={week} setWeek={setWeek} open={open} toggle={toggle} goto={goto}
             onNew={(date) => setSheet({ date })} onEdit={(e) => setSheet(e)} onSample={loadSample} hasEntries={entriesAll.length > 0} />
@@ -1632,7 +1955,7 @@ export default function App() {
         {view === "ingredients" && <IngredientsView ingredients={ingredients} stock={state.stock} entriesAll={entriesAll} d={d} open={open} toggle={toggle} goto={goto} updateIng={updateIng} deleteIng={deleteIng} addIng={addIng} />}
         {view === "storage" && (
           <StorageView config={config} setConfig={setConfig} adapter={adapterRef.current} sync={sync} state={state}
-            pending={pending} conflicts={conflicts} error={error}
+            pending={pending} conflicts={conflicts} error={error} p2pPeers={p2pPeers} syncLink={syncLink}
             onConnect={connect} onDisconnect={disconnect} onJoinDrive={joinDrive} onLeaveDrive={leaveDriveFolder} onSync={() => runSync(false)}
             onShare={(on) => adapterRef.current.share?.(on).catch((e) => setError(e.message))}
             onWipeCache={wipeCache} />

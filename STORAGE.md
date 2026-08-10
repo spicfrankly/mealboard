@@ -31,11 +31,63 @@ The baseline is what makes reconciliation possible rather than guesswork.
 | This device   | nothing — the cache is the truth    | nothing                     |
 | Google Drive  | five CSVs in an app-created folder  | OAuth client ID             |
 | Self-hosted   | `GET`/`PUT` per CSV                 | a URL, optionally a token   |
+| Peer-to-peer  | a Yjs document, over WebRTC or SMS  | a shared passphrase         |
 
 The self-hosted contract is deliberately small: `GET {base}/entries.csv`,
 `PUT {base}/entries.csv`. Nextcloud WebDAV satisfies it, as does the bundled
 `deploy/dataserver/server.mjs`, as does anything else you already run. The
 server must allow your site origin via CORS for GET and PUT.
+
+## Peer-to-peer
+
+No account and no server: collaborators who type the same passphrase sync
+directly, browser to browser.
+
+**The passphrase is the entire trust boundary.** Anyone who has it can read
+and change the plan; anyone who does not cannot reach it at all. There is no
+account to revoke and no server to lock — changing the passphrase means
+everyone moves to a new room together, and stale copies of the plan stay on
+whatever devices already had them. Share it in person or over a channel you
+trust, and never in the same message as a sync link.
+
+The passphrase itself never leaves the device. It is used three ways:
+
+- `SHA-256("mealboard-room-v1:" + passphrase)`, truncated, is the room name
+  peers announce to the public signalling relay. The relay sees that hash and
+  nothing else — not the words, not the plan.
+- `y-webrtc`'s own `password` option (PBKDF2 100k/SHA-256 → AES-256-GCM)
+  encrypts the signalling traffic, so a peer without the passphrase cannot
+  complete the handshake. The data channel itself is then protected by
+  WebRTC's DTLS.
+- A separately salted key (`mealboard-sms-v1`, same PBKDF2 → AES-256-GCM
+  construction) encrypts sync links, keeping the link key independent of the
+  room key.
+
+**Store and forward by text message.** When nobody is online at the same
+time, the Storage tab builds a link — `?sync=<base64url(iv‖ciphertext)>` —
+and hands it to the phone's SMS composer, or the clipboard for devices with
+no SMS app. The payload is the whole document (`Y.encodeStateAsUpdate`), not
+a diff: applying it is idempotent and order-independent, so opening the same
+link twice, or two links out of order, converges either way and nothing has
+to track what a contact already received — which a text message could never
+confirm anyway. The trade is link length, which grows with the plan.
+
+An arriving link is not applied blind. It is decrypted, replayed into a
+scratch document, and fed to the same three-way reconcile every other target
+uses, as one more `remote` snapshot — so a stale link can never roll back
+newer local edits. The `?sync=` parameter stays in the address bar until the
+update actually applies, so a first-time recipient who has not set the
+passphrase yet does not lose it by opening the link. Because the update
+arrived outside the configured data source, the baseline does not advance:
+the new records stay pending until a real sync carries them onward.
+
+The "unsent" marker beside each contact compares the plan's newest
+`updated_at` against the last time you tapped Send for that person. It is a
+reminder, not a delivery receipt.
+
+Yjs is confined to this adapter. Above it, `readTables`/`writeTables`
+exchange exactly the same flat CSV-shaped rows as Drive and self-hosted, and
+`updated_at` — not Yjs's last-write-wins — still decides every conflict.
 
 ## Reconciliation
 
@@ -72,6 +124,10 @@ device had not seen yet, and would resurrect on the next sync.
   visible to another account's own folder search.
 - **Self-hosted** — you want the data on your own hardware and Google nowhere
   near it.
+- **Peer-to-peer** — a household that wants to share a plan with no account
+  and nothing to run. Agree on a passphrase, everyone types it, and the
+  devices find each other. Add the people you cannot rely on catching online
+  as text-message contacts so the plan can still reach them.
 
 Switching targets does not migrate data. Export the CSVs from the old target
 and drop them into the new one if you need to carry the plan across.
