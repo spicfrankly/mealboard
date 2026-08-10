@@ -230,6 +230,7 @@ const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
 const CACHE_KEY = "mealboard.cache";
 const BASE_KEY = "mealboard.baseline";
 const CONF_KEY = "mealboard.config";
+const ROSTER_KEY = "mealboard.roster";
 
 const TABLES = {
   ingredients: { file: "ingredients.csv", cols: ["id", "name", "category", "unit", "updated_at", "deleted"] },
@@ -688,6 +689,79 @@ function tablesIntoDoc(doc, tables) {
   });
 }
 
+/* --- the roster: who else is on this plan. It rides in the same doc as the
+       tables — free, since the whole doc syncs either way — but the doc is
+       only ever the transport. The plain `roster` object App holds is the
+       store of record, exactly as `state` is for the tables, and `updatedAt`
+       decides per entry, so merging two snapshots is order-independent and
+       never cares which throwaway doc produced which write. --- */
+
+const memberEntry = (patch) => ({
+  memberId: "", name: "", phone: "", status: "pending", inviteCode: "", invitedBy: "",
+  invitedAt: 0, confirmedAt: 0, lastSeenEditAt: 0, lastSeenAt: 0, updatedAt: now(), ...patch,
+});
+
+function docToRoster(doc) {
+  const out = {};
+  doc.getMap("roster").forEach((v, k) => (out[k] = v));
+  return out;
+}
+
+function rosterIntoDoc(doc, roster) {
+  doc.transact(() => {
+    const m = doc.getMap("roster");
+    Object.values(roster || {}).forEach((e) => {
+      if (!e || !e.memberId) return;
+      const cur = m.get(e.memberId);
+      if (sameRecord(cur, e) || (cur && num(cur.updatedAt) >= num(e.updatedAt))) return;
+      m.set(e.memberId, e);
+    });
+  });
+}
+
+/* Two plain snapshots cannot merge themselves; a scratch doc does it. */
+function mergeRosters(a, b) {
+  const doc = new Y.Doc();
+  rosterIntoDoc(doc, a);
+  rosterIntoDoc(doc, b);
+  const out = docToRoster(doc);
+  doc.destroy();
+  return out;
+}
+
+const sameRoster = (a, b) => {
+  const ka = Object.keys(a || {}), kb = Object.keys(b || {});
+  return ka.length === kb.length && ka.every((k) => sameRecord(a[k], b[k]));
+};
+
+const inviteCode = () => String(100000 + (crypto.getRandomValues(new Uint32Array(1))[0] % 900000));
+
+/* Everyone reports their own high-water mark and nobody guesses for anybody
+   else. The write is ordinary roster data, so it travels onward in the next
+   link or live pull like any other field — that is the whole mechanism. */
+function noteSelfSeen(setRoster, memberId, state) {
+  if (!memberId) return;
+  const t = maxUpdatedAt(state);
+  setRoster((r) => {
+    const mine = r[memberId];
+    if (!mine || t <= num(mine.lastSeenEditAt)) return r;
+    return { ...r, [memberId]: { ...mine, lastSeenEditAt: t, lastSeenAt: now(), updatedAt: now() } };
+  });
+}
+
+/* Confirming a code proves the opener received the text sent to that number,
+   nothing more — not who owns the phone, and not access, which the
+   passphrase alone still decides. */
+function resolveInvite(roster, memberId, code) {
+  const e = (roster || {})[memberId];
+  if (!e) return { ok: false, reason: "That invite is not in this plan yet. Ask whoever invited you to send a fresh link." };
+  if (e.status === "cancelled") return { ok: false, reason: "That invite was cancelled. Ask for a new one." };
+  if (String(e.inviteCode) !== String(code)) return { ok: false, reason: "That invite code does not match the one in the plan. Ask for a new invite." };
+  if (e.status === "confirmed") return { ok: true, memberId, roster };
+  const t = now();
+  return { ok: true, memberId, roster: { ...roster, [memberId]: { ...e, status: "confirmed", confirmedAt: t, lastSeenAt: t, updatedAt: t } } };
+}
+
 /* SignalingConn sends the room name to the public signalling server in
    clear, so the passphrase itself can never be the room name. */
 async function deriveRoomName(passphrase) {
@@ -739,9 +813,10 @@ async function decodeSyncPayload(passphrase, payload) {
    received — which a text message could never tell us anyway. It is built
    from live state rather than the adapter's doc so it always matches what
    the sender can see on screen, connected or not. */
-async function buildSyncLink(passphrase, state) {
+async function buildSyncLink(passphrase, state, roster) {
   const doc = new Y.Doc();
   tablesIntoDoc(doc, stateToTables(state));
+  rosterIntoDoc(doc, roster);
   const payload = await encodeSyncPayload(passphrase, Y.encodeStateAsUpdate(doc));
   doc.destroy();
   const loc = window.location;
@@ -751,9 +826,9 @@ async function buildSyncLink(passphrase, state) {
 async function decodeSyncState(passphrase, payload) {
   const doc = new Y.Doc();
   Y.applyUpdate(doc, await decodeSyncPayload(passphrase, payload));
-  const s = tablesToState(docToTables(doc));
+  const s = tablesToState(docToTables(doc)), roster = docToRoster(doc);
   doc.destroy();
-  return s;
+  return { state: s, roster };
 }
 
 function p2pAdapter(cfg) {
@@ -788,6 +863,10 @@ function p2pAdapter(cfg) {
     async readTables() { return docToTables(st.doc); },
 
     async writeTables(tables) { tablesIntoDoc(st.doc, tables); },
+
+    readRoster() { return st.doc ? docToRoster(st.doc) : {}; },
+
+    writeRoster(roster) { if (st.doc) rosterIntoDoc(st.doc, roster); },
   };
 }
 
@@ -1311,19 +1390,34 @@ function IngredientsView({ ingredients, stock, entriesAll, d, open, toggle, goto
 /* Storage view                                                       */
 /* ================================================================== */
 
-function StorageView({ config, setConfig, adapter, sync, state, pending, conflicts, error, p2pPeers, syncLink, onConnect, onDisconnect, onJoinDrive, onLeaveDrive, onSync, onShare, onWipeCache }) {
+function StorageView({ config, setConfig, adapter, sync, state, pending, conflicts, error, p2pPeers, syncLink, roster, missing, onInvite, onInviteLink, onCancelInvite, onConnect, onDisconnect, onJoinDrive, onLeaveDrive, onSync, onShare, onWipeCache }) {
   const [draft, setDraft] = useState(config);
   useEffect(() => setDraft(config), [config]);
   const [newContact, setNewContact] = useState({ name: "", phone: "" });
+  const [invite, setInvite] = useState(null);
+  const [inviteBusy, setInviteBusy] = useState(false);
   const [copied, setCopied] = useState("");
   const origin = typeof window !== "undefined" ? window.location.origin : "";
   const apply = (patch) => setConfig({ ...config, ...patch });
 
-  const contacts = config.p2pContacts || [];
-  const lastEdit = maxUpdatedAt(state);
-  const patchContacts = (fn) => apply({ p2pContacts: fn(contacts) });
-  const markSent = (id) => patchContacts((cs) => cs.map((c) => (c.id === id ? { ...c, lastSentAt: now() } : c)));
+  const behind = new Set((missing || []).map((m) => m.memberId));
+  const members = Object.values(roster || {}).filter((m) => m.status !== "cancelled").sort((a, b) =>
+    (a.memberId === config.p2pMemberId ? -1 : b.memberId === config.p2pMemberId ? 1 : 0) ||
+    String(a.name || a.phone || "").localeCompare(String(b.name || b.phone || "")));
+
   const smsHref = (phone) => `sms:${phone}?body=${encodeURIComponent("Mealboard plan update — open this to merge it: " + syncLink)}`;
+  const inviteHref = (inv) => `sms:${inv.phone}?body=${encodeURIComponent(
+    `Join our Mealboard plan: ${inv.url}\n` +
+    `Open it, then enter the passphrase I gave you separately, and this code if asked: ${inv.code}`)}`;
+  const showInvite = async (make) => {
+    setInviteBusy(true);
+    try { const inv = await make(); if (inv) setInvite(inv); } finally { setInviteBusy(false); }
+  };
+  const copy = (key, text) => {
+    navigator.clipboard?.writeText(text);
+    setCopied(key);
+    setTimeout(() => setCopied(""), 1500);
+  };
 
   const download = (t) => {
     const csv = toCSV(TABLES[t].cols, stateToTables(state)[t]);
@@ -1483,41 +1577,69 @@ function StorageView({ config, setConfig, adapter, sync, state, pending, conflic
           </div>
 
           <div className="mb-panel">
-            <div className="mb-group-head"><span className="mb-h">Text-message contacts</span><span className="mb-day-rule" /></div>
-            <p>When nobody is online at the same time, send the plan as a link. It carries the whole plan encrypted with the same passphrase, and opening it twice changes nothing.</p>
-            {contacts.length === 0 && <div className="mb-none">Nobody added yet.</div>}
-            {contacts.map((c) => (
-              <div className="mb-row" key={c.id}>
-                <div className="mb-row-main">
-                  <div className="mb-row-text">
-                    <div className="mb-row-name">{c.name || c.phone}</div>
-                    <div className="mb-row-sub">{c.phone} · last sent {clock(c.lastSentAt)}</div>
+            <div className="mb-group-head"><span className="mb-h">Roster</span><span className="mb-day-rule" /></div>
+            <p>Everyone on this plan, shared with the plan itself. Invite someone by text and they get a link plus a six-digit code; confirming it puts their name against the acknowledgements that follow. When nobody is online at the same time, send the plan as a link — it carries the whole plan encrypted with the same passphrase, and opening it twice changes nothing.</p>
+            {!config.p2pMemberId && (
+              <div className="mb-note">Press <strong>Start</strong> above once to take your own place on the roster. Until then nothing can be acknowledged for you.</div>
+            )}
+            {members.length === 0 && <div className="mb-none">Nobody on the roster yet.</div>}
+            {members.map((m) => {
+              const self = m.memberId === config.p2pMemberId;
+              const pend = m.status === "pending";
+              return (
+                <div className="mb-row" key={m.memberId}>
+                  <div className="mb-row-main">
+                    <div className="mb-row-text">
+                      <div className="mb-row-name">{m.name || m.phone || "Unnamed"}{self ? " (you)" : ""}</div>
+                      <div className="mb-row-sub">
+                        {m.phone ? m.phone + " · " : ""}
+                        {pend ? "waiting to confirm — invited " + clock(m.invitedAt) : "last acknowledged " + clock(m.lastSeenAt)}
+                      </div>
+                    </div>
+                    <span className="mb-pill">{pend ? "pending" : "confirmed"}</span>
+                    {!self && !pend && <span className="mb-pill">{behind.has(m.memberId) ? "needs update" : "up to date"}</span>}
                   </div>
-                  {lastEdit > (c.lastSentAt || 0) && <span className="mb-pill">unsent</span>}
-                  <button className="mb-x" onClick={() => patchContacts((cs) => cs.filter((x) => x.id !== c.id))} aria-label={"Remove " + (c.name || c.phone)}>✕</button>
+                  {!self && !pend && (
+                    <div className="mb-two" style={{ padding: "0 11px 11px" }}>
+                      <a className="mb-btn ghost" style={{ textDecoration: "none", opacity: syncLink && m.phone ? 1 : 0.45, pointerEvents: syncLink && m.phone ? "auto" : "none" }}
+                        href={syncLink && m.phone ? smsHref(m.phone) : undefined}>Text update</a>
+                      <button className="mb-btn ghost" disabled={!syncLink} onClick={() => copy(m.memberId, syncLink)}>{copied === m.memberId ? "Copied" : "Copy link"}</button>
+                    </div>
+                  )}
+                  {!self && pend && (
+                    <div className="mb-two" style={{ padding: "0 11px 11px" }}>
+                      <button className="mb-btn ghost" disabled={inviteBusy} onClick={() => showInvite(() => onInviteLink(m))}>Resend invite</button>
+                      <button className="mb-btn danger" onClick={() => { onCancelInvite(m.memberId); if (invite?.memberId === m.memberId) setInvite(null); }}>Cancel invite</button>
+                    </div>
+                  )}
                 </div>
-                <div className="mb-two" style={{ padding: "0 11px 11px" }}>
-                  <a className="mb-btn ghost" style={{ textDecoration: "none", opacity: syncLink ? 1 : 0.45, pointerEvents: syncLink ? "auto" : "none" }}
-                    href={syncLink ? smsHref(c.phone) : undefined} onClick={() => markSent(c.id)}>Text update</a>
-                  <button className="mb-btn ghost" disabled={!syncLink} onClick={() => {
-                    navigator.clipboard?.writeText(syncLink);
-                    setCopied(c.id); markSent(c.id);
-                    setTimeout(() => setCopied(""), 1500);
-                  }}>{copied === c.id ? "Copied" : "Copy link"}</button>
+              );
+            })}
+
+            {invite && (
+              <div className="mb-note good" style={{ marginTop: 10 }}>
+                Invite ready for <strong>{invite.name || invite.phone}</strong>. Their code is <code>{invite.code}</code> — send it too, in case the phone shortens the link.
+                <div className="mb-two" style={{ marginTop: 8 }}>
+                  <a className="mb-btn ghost" style={{ textDecoration: "none", opacity: invite.phone ? 1 : 0.45, pointerEvents: invite.phone ? "auto" : "none" }}
+                    href={invite.phone ? inviteHref(invite) : undefined}>Text invite</a>
+                  <button className="mb-btn ghost" onClick={() => copy("invite", invite.url)}>{copied === "invite" ? "Copied" : "Copy invite link"}</button>
                 </div>
               </div>
-            ))}
+            )}
+
             <div className="mb-two" style={{ marginTop: 10 }}>
               <input className="mb-input" placeholder="Name" value={newContact.name} onChange={(e) => setNewContact({ ...newContact, name: e.target.value })} />
               <input className="mb-input" type="tel" placeholder="+15550100" value={newContact.phone} onChange={(e) => setNewContact({ ...newContact, phone: e.target.value })} />
             </div>
-            <button className="mb-btn ghost" style={{ width: "100%", marginTop: 8 }} disabled={!newContact.phone.trim()}
-              onClick={() => {
-                patchContacts((cs) => [...cs, { id: uid(), name: newContact.name.trim(), phone: newContact.phone.trim(), lastSentAt: 0 }]);
-                setNewContact({ name: "", phone: "" });
-              }}>Add contact</button>
+            <button className="mb-btn ghost" style={{ width: "100%", marginTop: 8 }} disabled={!newContact.phone.trim() || !config.p2pPassphrase || inviteBusy}
+              onClick={() => showInvite(async () => {
+                const inv = await onInvite(newContact);
+                if (inv) setNewContact({ name: "", phone: "" });
+                return inv;
+              })}>{inviteBusy ? "Building invite…" : "Invite by text"}</button>
             <div className="mb-note" style={{ marginTop: 12, marginBottom: 0 }}>
-              “Unsent” only means the plan changed since you last tapped Send for that person — it is a reminder, not a delivery receipt. Long plans make long links, and some phones shorten a message that runs past their limit; if a link will not open, use <strong>Copy link</strong> and paste it into a chat app instead.
+              A confirmed code only shows that whoever opened the link received the text you sent to that number. It is not proof of who owns the phone, and it is not what keeps the plan private — the passphrase is, and anyone who has it can join without an invite at all. Taking someone off the roster does not revoke anything either: they keep the passphrase and their copy of the plan.
+              {" "}“Needs update” means their last acknowledgement is older than your newest edit. Acknowledgements travel with the plan, so they arrive whenever that person next sends something to somebody — soon, but never instantly and never guaranteed. Long plans make long links, and some phones shorten a message that runs past their limit; if a link will not open, use <strong>Copy link</strong> and paste it into a chat app instead.
             </div>
           </div>
         </>
@@ -1594,13 +1716,16 @@ function sampleState(base) {
 /* App                                                                */
 /* ================================================================== */
 
-const defaultConfig = { target: "local", clientId: "", pickerApiKey: "", folderName: "Mealboard", driveFolderId: "", httpBase: "", httpToken: "", httpUser: "", httpPass: "", p2pPassphrase: "", p2pContacts: [], autoSync: true };
+const defaultConfig = { target: "local", clientId: "", pickerApiKey: "", folderName: "Mealboard", driveFolderId: "", httpBase: "", httpToken: "", httpUser: "", httpPass: "", p2pPassphrase: "", p2pMemberId: "", autoSync: true };
 
 export default function App() {
   /* Layer 1 — the live copy. Seeded synchronously from layer 2. */
   const [state, setState] = useState(() => readCachedState(CACHE_KEY) || emptyState());
   const [config, setConfigState] = useState(() => {
     try { return { ...defaultConfig, ...JSON.parse(cache.get(CONF_KEY) || "{}") }; } catch { return defaultConfig; }
+  });
+  const [roster, setRosterState] = useState(() => {
+    try { return JSON.parse(cache.get(ROSTER_KEY) || "{}"); } catch { return {}; }
   });
 
   const [view, setView] = useState("calendar");
@@ -1614,6 +1739,8 @@ export default function App() {
 
   const baseline = useRef(readCachedState(BASE_KEY) || emptyState());
   const stateRef = useRef(state); stateRef.current = state;
+  const rosterRef = useRef(roster); rosterRef.current = roster;
+  const memberIdRef = useRef(config.p2pMemberId); memberIdRef.current = config.p2pMemberId;
   const adapterRef = useRef(null);
   const busy = useRef(false);
 
@@ -1637,6 +1764,15 @@ export default function App() {
       const next = fn(s);
       writeCachedState(CACHE_KEY, next);
       return next;
+    });
+  }, []);
+
+  /* Same shape as `mutate`, for the other thing this device owns a copy of. */
+  const setRoster = useCallback((next) => {
+    setRosterState((r) => {
+      const v = typeof next === "function" ? next(r) : next;
+      cache.set(ROSTER_KEY, JSON.stringify(v));
+      return v;
     });
   }, []);
 
@@ -1678,13 +1814,14 @@ export default function App() {
       if (r.fromLocal > 0 || r.conflicts.length > 0) await ad.writeTables(stateToTables(r.merged));
 
       commitReconciled(r, true);
+      noteSelfSeen(setRoster, memberIdRef.current, r.merged);
     } catch (e) {
       setSync((s) => ({ ...s, status: "bad" }));
       if (!silent) setError(e.message || String(e));
     } finally {
       busy.current = false;
     }
-  }, [commitReconciled]);
+  }, [commitReconciled, setRoster]);
 
   /* auto-reconcile */
   useEffect(() => {
@@ -1704,11 +1841,18 @@ export default function App() {
   const [p2pPeers, setP2pPeers] = useState(0);
   const [syncLink, setSyncLink] = useState("");
   const [inbound, setInbound] = useState("");
+  const [parkedInvite, setParkedInvite] = useState(null);
 
-  const contacts = config.p2pContacts || [];
   const lastEdit = useMemo(() => maxUpdatedAt(state), [state]);
-  const unsent = useMemo(() => contacts.filter((c) => lastEdit > (c.lastSentAt || 0)), [contacts, lastEdit]);
-  const nudge = config.target === "p2p" && unsent.length > 0;
+  const others = useMemo(
+    () => Object.values(roster).filter((m) => m.memberId !== config.p2pMemberId && m.status !== "cancelled"),
+    [roster, config.p2pMemberId]
+  );
+  const missing = useMemo(
+    () => others.filter((m) => m.status === "confirmed" && lastEdit > num(m.lastSeenEditAt)),
+    [others, lastEdit]
+  );
+  const nudge = config.target === "p2p" && missing.length > 0;
 
   /* The adapter mutates its peer count outside React; poll rather than
      invent an event contract for one target. */
@@ -1718,18 +1862,33 @@ export default function App() {
     return () => clearInterval(t);
   }, [config.target]);
 
+  /* Two connected peers converge on the shared doc by themselves, so the
+     roster needs no protocol of its own — just the same cadence as the peer
+     count to carry the doc's copy into the local mirror and back out again. */
+  useEffect(() => {
+    if (config.target !== "p2p") return;
+    const t = setInterval(() => {
+      const ad = adapterRef.current;
+      if (!ad?.readRoster || !ad.connected()) return;
+      const merged = mergeRosters(rosterRef.current, ad.readRoster());
+      if (!sameRoster(merged, rosterRef.current)) setRoster(merged);
+      ad.writeRoster(merged);
+    }, 2000);
+    return () => clearInterval(t);
+  }, [config.target, setRoster]);
+
   /* Every link is a whole encrypted snapshot, so it is rebuilt whenever the
      plan changes — debounced, and only while someone is there to send it to. */
   useEffect(() => {
-    if (config.target !== "p2p" || !config.p2pPassphrase || contacts.length === 0) { setSyncLink(""); return; }
+    if (config.target !== "p2p" || !config.p2pPassphrase || others.length === 0) { setSyncLink(""); return; }
     let live = true;
     const t = setTimeout(() => {
-      buildSyncLink(config.p2pPassphrase, stateRef.current)
+      buildSyncLink(config.p2pPassphrase, stateRef.current, rosterRef.current)
         .then((u) => { if (live) setSyncLink(u); })
         .catch(() => { if (live) setSyncLink(""); });
     }, 800);
     return () => { live = false; clearTimeout(t); };
-  }, [config.target, config.p2pPassphrase, contacts.length, state]);
+  }, [config.target, config.p2pPassphrase, others.length, state, roster]);
 
   useEffect(() => {
     if (!nudge) return;
@@ -1739,8 +1898,12 @@ export default function App() {
   }, [nudge]);
 
   useEffect(() => {
-    const payload = new URLSearchParams(window.location.search).get("sync");
+    const q = new URLSearchParams(window.location.search);
+    const payload = q.get("sync"), iid = q.get("iid"), code = q.get("code");
     if (payload) setInbound(payload);
+    /* Invite params travel in the clear: meaningless without the encrypted
+       payload beside them, and without the passphrase that opens it. */
+    if (iid && code) setParkedInvite({ iid, code });
   }, []);
 
   /* An inbound link is just one more remote snapshot — reconciled, never
@@ -1748,7 +1911,7 @@ export default function App() {
      actually been applied, so a recipient who has not set the passphrase
      yet does not lose the update by opening it. */
   useEffect(() => {
-    if (!inbound) return;
+    if (!inbound && !parkedInvite) return;
     if (!config.p2pPassphrase) {
       setView("storage");
       setError("This link carries a shared plan update. Pick Peer-to-peer below and enter the passphrase it was encrypted with — the update is applied as soon as it matches.");
@@ -1757,9 +1920,34 @@ export default function App() {
     let live = true;
     (async () => {
       try {
-        const remote = await decodeSyncState(config.p2pPassphrase, inbound);
-        if (!live) return;
-        commitReconciled(reconcile(baseline.current, clone(stateRef.current), remote), false);
+        let merged = rosterRef.current, seen = stateRef.current;
+        if (inbound) {
+          const { state: remote, roster: incoming } = await decodeSyncState(config.p2pPassphrase, inbound);
+          if (!live) return;
+          merged = mergeRosters(merged, incoming);
+          const r = reconcile(baseline.current, clone(stateRef.current), remote);
+          commitReconciled(r, false);
+          seen = r.merged;
+        }
+        let mine = config.p2pMemberId;
+        if (parkedInvite) {
+          const res = resolveInvite(merged, parkedInvite.iid, parkedInvite.code);
+          if (res.ok) {
+            merged = res.roster;
+            mine = res.memberId;
+            if (res.memberId !== config.p2pMemberId) {
+              memberIdRef.current = res.memberId;
+              setConfig({ ...config, p2pMemberId: res.memberId });
+            }
+          } else {
+            setView("storage");
+            setError(res.reason);
+          }
+          setParkedInvite(null);
+        }
+        setRoster(merged);
+        rosterRef.current = merged;
+        noteSelfSeen(setRoster, mine, seen);
         setInbound("");
         window.history.replaceState(null, "", window.location.pathname + window.location.hash);
       } catch {
@@ -1769,7 +1957,7 @@ export default function App() {
       }
     })();
     return () => { live = false; };
-  }, [inbound, config.target, config.p2pPassphrase, commitReconciled]);
+  }, [inbound, parkedInvite, config.target, config.p2pPassphrase, config.p2pMemberId, commitReconciled, setRoster]);
 
   const connect = async () => {
     setError(""); setSync((s) => ({ ...s, status: "busy" }));
@@ -1783,6 +1971,24 @@ export default function App() {
          local changes, which is what a first connect actually is. */
       baseline.current = emptyState();
       writeCachedState(BASE_KEY, baseline.current);
+
+      /* Anyone in the room belongs on the roster, invited or not — the
+         passphrase is what let them in, so the creator and anyone who was
+         simply told the words both register themselves here. An invitee is
+         the one exception: the id they confirm was minted by the inviter. */
+      if (adapterRef.current.writeRoster) {
+        let next = rosterRef.current;
+        if (!config.p2pMemberId && !parkedInvite) {
+          const memberId = uid(), t = now();
+          next = { ...next, [memberId]: memberEntry({ memberId, status: "confirmed", invitedAt: t, confirmedAt: t, updatedAt: t }) };
+          setRoster(next);
+          rosterRef.current = next;
+          memberIdRef.current = memberId;
+          setConfig({ ...config, p2pMemberId: memberId });
+        }
+        adapterRef.current.writeRoster(next);
+      }
+
       await runSync(false);
     } catch (e) {
       setSync((s) => ({ ...s, status: "bad" }));
@@ -1791,6 +1997,39 @@ export default function App() {
   };
 
   const disconnect = () => { adapterRef.current?.disconnect?.(); setSync({ status: "idle", at: 0 }); setConflicts([]); };
+
+  /* Built here, not from the debounced link above, so the invite that was
+     just written is certain to be inside the payload the invitee opens. */
+  const inviteLink = async (entry, snapshot) => {
+    try {
+      const link = await buildSyncLink(config.p2pPassphrase, stateRef.current, snapshot || rosterRef.current);
+      return { memberId: entry.memberId, name: entry.name, phone: entry.phone, code: entry.inviteCode, url: `${link}&iid=${entry.memberId}&code=${entry.inviteCode}` };
+    } catch (e) {
+      setError(e.message || String(e));
+      return null;
+    }
+  };
+
+  const createInvite = async ({ name, phone }) => {
+    if (!config.p2pPassphrase) { setError("Set the shared passphrase before inviting anyone."); return null; }
+    const t = now();
+    const entry = memberEntry({
+      memberId: uid(), name: (name || "").trim(), phone: (phone || "").trim(),
+      status: "pending", inviteCode: inviteCode(), invitedBy: config.p2pMemberId || "", invitedAt: t, updatedAt: t,
+    });
+    const next = { ...rosterRef.current, [entry.memberId]: entry };
+    setRoster(next);
+    rosterRef.current = next;
+    return inviteLink(entry, next);
+  };
+
+  /* A tombstone, not a removal: a deleted key would simply come back on the
+     next merge. It revokes nothing — they still have the passphrase. */
+  const cancelInvite = (memberId) => setRoster((r) => {
+    const e = r[memberId];
+    if (!e) return r;
+    return { ...r, [memberId]: { ...e, status: "cancelled", inviteCode: "", updatedAt: now() } };
+  });
 
   const joinDrive = async () => {
     setError(""); setSync((s) => ({ ...s, status: "busy" }));
@@ -1939,7 +2178,7 @@ export default function App() {
           <div className="mb-view">
             <div className="mb-note" style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 0 }}>
               <span style={{ flex: 1 }}>
-                {unsent.length} contact{unsent.length === 1 ? " hasn't" : "s haven't"} had your latest changes by text yet.
+                {missing.length} {missing.length === 1 ? "person hasn't" : "people haven't"} acknowledged your latest changes yet.
               </span>
               <button className="mb-btn ghost" style={{ padding: "6px 12px", fontSize: 12.5, flex: "none" }} onClick={() => setView("storage")}>Send now</button>
             </div>
@@ -1956,6 +2195,7 @@ export default function App() {
         {view === "storage" && (
           <StorageView config={config} setConfig={setConfig} adapter={adapterRef.current} sync={sync} state={state}
             pending={pending} conflicts={conflicts} error={error} p2pPeers={p2pPeers} syncLink={syncLink}
+            roster={roster} missing={missing} onInvite={createInvite} onInviteLink={inviteLink} onCancelInvite={cancelInvite}
             onConnect={connect} onDisconnect={disconnect} onJoinDrive={joinDrive} onLeaveDrive={leaveDriveFolder} onSync={() => runSync(false)}
             onShare={(on) => adapterRef.current.share?.(on).catch((e) => setError(e.message))}
             onWipeCache={wipeCache} />

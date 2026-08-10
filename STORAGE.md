@@ -17,10 +17,11 @@ If `localStorage` is unavailable (private mode, sandboxed frame, storage
 disabled) the same interface falls back to an in-memory map — the app keeps
 working, it just forgets on reload. The Storage tab shows which mode is live.
 
-Two keys:
+Three keys:
 
 - `mealboard.cache`    — current state
 - `mealboard.baseline` — the state as it stood at the last successful sync
+- `mealboard.roster`   — this device's copy of the peer-to-peer roster
 
 The baseline is what makes reconciliation possible rather than guesswork.
 
@@ -68,9 +69,10 @@ time, the Storage tab builds a link — `?sync=<base64url(iv‖ciphertext)>` —
 and hands it to the phone's SMS composer, or the clipboard for devices with
 no SMS app. The payload is the whole document (`Y.encodeStateAsUpdate`), not
 a diff: applying it is idempotent and order-independent, so opening the same
-link twice, or two links out of order, converges either way and nothing has
-to track what a contact already received — which a text message could never
-confirm anyway. The trade is link length, which grows with the plan.
+link twice, or two links out of order, converges either way and the sender
+never has to track what the other side already received — the receiver
+reports that for itself, further down. The trade is link length, which grows
+with the plan.
 
 An arriving link is not applied blind. It is decrypted, replayed into a
 scratch document, and fed to the same three-way reconcile every other target
@@ -81,13 +83,67 @@ passphrase yet does not lose it by opening the link. Because the update
 arrived outside the configured data source, the baseline does not advance:
 the new records stay pending until a real sync carries them onward.
 
-The "unsent" marker beside each contact compares the plan's newest
-`updated_at` against the last time you tapped Send for that person. It is a
-reminder, not a delivery receipt.
+### The roster
+
+Who else is on the plan is part of the plan. Each member is one entry —
+`memberId`, name, phone, `status`, invite code, and the two acknowledgement
+fields below — living in a `roster` map inside the same Yjs document as the
+tables, which costs nothing extra because the whole document syncs either
+way. As with the tables, the document is only the transport: the store of
+record is the plain object in `mealboard.roster`, and an entry's own
+`updatedAt` decides which of two copies wins, so merging two snapshots is
+order-independent and never depends on a document surviving a reload.
+
+**Joining.** Anyone who types the passphrase takes a place on the roster the
+first time they press Start. That is the plain case, and it never needs an
+invite — the passphrase alone is what admits them.
+
+**Inviting.** The nicer path is an invite: the inviter mints the new member's
+id and a six-digit code, writes the entry as `pending`, and texts a link of
+the form `?sync=…&iid=<memberId>&code=<code>`, with the code repeated in
+plain text because phones truncate long messages. The invitee opens it,
+enters the passphrase, and the code is matched against the pending entry,
+which flips to `confirmed` in place — no re-keying, because the id came from
+the inviter in the first place. The `iid` and `code` travel in the clear,
+which costs nothing: they are meaningless without the encrypted payload
+beside them, and without the passphrase that opens it.
+
+**What a confirmed code proves**, exactly: whoever opened that link received
+the text sent to that number. Not who owns the phone, not who the person is,
+and above all not access — the passphrase is still the entire boundary, and
+someone who has it is in the room whether or not anyone invited them.
+Cancelling an invite or dropping someone from the roster revokes nothing, for
+exactly the same reason the passphrase itself cannot be revoked: they keep
+the words and their own copy of the plan. The roster is a courtesy layer for knowing who is
+here and who has seen what — never a gate. (Cancelling writes a tombstone
+rather than deleting the entry, because a deleted key would simply reappear
+from the next peer to merge.)
+
+### Acknowledgement
+
+Each member writes one number into their own entry — `lastSeenEditAt`, the
+newest `updated_at` they have personally applied — every time a sync or an
+inbound link succeeds. "Needs update" beside somebody is that number compared
+against the plan's current newest `updated_at`. Nobody guesses on anyone
+else's behalf, which is the whole difference from the old per-device "unsent"
+marker: it is a report from the receiver, not a memory of what the sender
+tapped.
+
+It is still not a delivery receipt, and the propagation is honestly
+gossip-shaped. An acknowledgement is ordinary roster data, so it reaches you
+the same way any other change does: over WebRTC while you are both online, or
+carried inside the next link that person sends to anybody. **A member who
+only ever receives and never sends anything onward never propagates their own
+acknowledgement** — you will keep seeing "needs update" for them even though
+they are perfectly up to date. Eventual, not instant, and not guaranteed.
+The reminder banner that appears right after an inbound link applies is the
+affordance that shortens the loop: relaying onward is what carries everyone's
+acknowledgements with it.
 
 Yjs is confined to this adapter. Above it, `readTables`/`writeTables`
-exchange exactly the same flat CSV-shaped rows as Drive and self-hosted, and
-`updated_at` — not Yjs's last-write-wins — still decides every conflict.
+exchange exactly the same flat CSV-shaped rows as Drive and self-hosted,
+`readRoster`/`writeRoster` exchange plain roster entries, and `updated_at` —
+not Yjs's last-write-wins — still decides every conflict.
 
 ## Reconciliation
 
@@ -126,8 +182,9 @@ device had not seen yet, and would resurrect on the next sync.
   near it.
 - **Peer-to-peer** — a household that wants to share a plan with no account
   and nothing to run. Agree on a passphrase, everyone types it, and the
-  devices find each other. Add the people you cannot rely on catching online
-  as text-message contacts so the plan can still reach them.
+  devices find each other. Invite the people you cannot rely on catching
+  online so they appear on the roster, and the plan can still reach them by
+  text when nobody is on at the same time.
 
 Switching targets does not migrate data. Export the CSVs from the old target
 and drop them into the new one if you need to carry the plan across.
