@@ -422,8 +422,57 @@ function loadGis() {
   return gisPromise;
 }
 
+/* drive.file scope only grants an app visibility into files it created
+   itself — a folder someone else merely shared with you never shows up
+   in a files.list search. Picker is the one flow Google recognises as
+   the user "opening" a file, which is what actually grants drive.file
+   access to something the app didn't create. */
+let pickerPromise = null;
+function loadPicker() {
+  if (pickerPromise) return pickerPromise;
+  pickerPromise = new Promise((resolve, reject) => {
+    if (window.google?.picker) return resolve(window.google);
+    const s = document.createElement("script");
+    s.src = "https://apis.google.com/js/api.js";
+    s.async = true;
+    s.onload = () => {
+      window.gapi.load("picker", {
+        callback: () => (window.google?.picker ? resolve(window.google) : reject(new Error("Google Picker unavailable"))),
+        onerror: () => reject(new Error("Could not load Google Picker")),
+      });
+    };
+    s.onerror = () => reject(new Error("Could not load Google APIs — sandboxed frame or offline"));
+    document.head.appendChild(s);
+  });
+  return pickerPromise;
+}
+
+function openFolderPicker(token, apiKey) {
+  if (!apiKey) return Promise.reject(new Error("Add a Picker API key first — Storage → Drive connection."));
+  return loadPicker().then((g) => new Promise((resolve, reject) => {
+    const view = new g.picker.DocsView(g.picker.ViewId.FOLDERS)
+      .setIncludeFolders(true)
+      .setSelectFolderEnabled(true)
+      .setMode(g.picker.DocsViewMode.LIST);
+    new g.picker.PickerBuilder()
+      .addView(view)
+      .setOAuthToken(token)
+      .setDeveloperKey(apiKey)
+      .setCallback((data) => {
+        if (data.action === g.picker.Action.PICKED) {
+          const doc = data.docs[0];
+          resolve({ id: doc.id, name: doc.name });
+        } else if (data.action === g.picker.Action.CANCEL) {
+          reject(new Error("Folder pick cancelled"));
+        }
+      })
+      .build()
+      .setVisible(true);
+  }));
+}
+
 function driveAdapter(cfg) {
-  const st = { token: null, expiry: 0, folderId: null, fileIds: {}, user: null };
+  const st = { token: null, expiry: 0, folderId: null, folderName: null, fileIds: {}, user: null };
 
   const api = async (url, opts = {}) => {
     if (!st.token) throw new Error("Not connected to Drive");
@@ -461,34 +510,60 @@ function driveAdapter(cfg) {
     return r.id;
   };
 
+  const identify = async () => {
+    try {
+      const about = await api("https://www.googleapis.com/drive/v3/about?fields=user(emailAddress)");
+      st.user = about.user?.emailAddress || null;
+    } catch { /* drive.file may not expose about */ }
+  };
+
+  const attachFolder = async (folderId) => {
+    st.folderId = folderId;
+    const listed = await api(`https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(`'${folderId}' in parents and trashed=false`)}&fields=files(id,name)&pageSize=100`);
+    (listed.files || []).forEach((f) => (st.fileIds[f.name] = f.id));
+    for (const n of TABLE_NAMES) {
+      if (!st.fileIds[TABLES[n].file]) st.fileIds[TABLES[n].file] = await createFile(TABLES[n].file, toCSV(TABLES[n].cols, []));
+    }
+  };
+
   return {
     id: "drive",
     needsConnect: true,
     connected: () => !!st.token,
-    describe: () => (st.token ? (st.user || "connected") + " · " + cfg.folderName : "not connected"),
+    describe: () => (st.token ? (st.user || "connected") + " · " + (st.folderName || cfg.folderName) : "not connected"),
     state: st,
     folderUrl: () => (st.folderId ? "https://drive.google.com/drive/folders/" + st.folderId : null),
 
     async connect() {
       await auth(true);
-      try {
-        const about = await api("https://www.googleapis.com/drive/v3/about?fields=user(emailAddress)");
-        st.user = about.user?.emailAddress || null;
-      } catch { /* drive.file may not expose about */ }
+      await identify();
+
+      if (cfg.driveFolderId) {
+        await attachFolder(cfg.driveFolderId);
+        return st.user;
+      }
 
       const q = encodeURIComponent(`name='${cfg.folderName.replace(/'/g, "\\'")}' and mimeType='application/vnd.google-apps.folder' and trashed=false`);
       const found = await api(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id)&pageSize=5`);
-      st.folderId = found.files?.[0]?.id || (await api("https://www.googleapis.com/drive/v3/files?fields=id", {
+      const folderId = found.files?.[0]?.id || (await api("https://www.googleapis.com/drive/v3/files?fields=id", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name: cfg.folderName, mimeType: "application/vnd.google-apps.folder" }),
       })).id;
-
-      const listed = await api(`https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(`'${st.folderId}' in parents and trashed=false`)}&fields=files(id,name)&pageSize=100`);
-      (listed.files || []).forEach((f) => (st.fileIds[f.name] = f.id));
-      for (const n of TABLE_NAMES) {
-        if (!st.fileIds[TABLES[n].file]) st.fileIds[TABLES[n].file] = await createFile(TABLES[n].file, toCSV(TABLES[n].cols, []));
-      }
+      await attachFolder(folderId);
       return st.user;
+    },
+
+    /* Join a folder someone else created and shared with you. Picking it
+       explicitly through Picker is what grants drive.file access to a
+       folder this app didn't create — a plain "Share by link" alone
+       never becomes visible to another account's files.list search. */
+    async joinSharedFolder() {
+      await auth(true);
+      await identify();
+      const picked = await openFolderPicker(st.token, cfg.pickerApiKey);
+      st.folderName = picked.name;
+      await attachFolder(picked.id);
+      return { id: picked.id, name: picked.name, user: st.user };
     },
 
     disconnect() { st.token = null; st.folderId = null; st.fileIds = {}; st.user = null; },
@@ -1092,7 +1167,7 @@ function IngredientsView({ ingredients, stock, entriesAll, d, open, toggle, goto
 /* Storage view                                                       */
 /* ================================================================== */
 
-function StorageView({ config, setConfig, adapter, sync, state, pending, conflicts, error, onConnect, onDisconnect, onSync, onShare, onWipeCache }) {
+function StorageView({ config, setConfig, adapter, sync, state, pending, conflicts, error, onConnect, onDisconnect, onJoinDrive, onLeaveDrive, onSync, onShare, onWipeCache }) {
   const [draft, setDraft] = useState(config);
   useEffect(() => setDraft(config), [config]);
   const origin = typeof window !== "undefined" ? window.location.origin : "";
@@ -1134,7 +1209,7 @@ function StorageView({ config, setConfig, adapter, sync, state, pending, conflic
 
       <div className="mb-group-head"><span className="mb-h">Data source</span><span className="mb-day-rule" /></div>
       <Target id="local" title="This device only" blurb="Cache is the source of truth. No account, no network, nothing leaves the browser. Clearing site data erases the plan — export the CSVs to keep a copy." />
-      <Target id="drive" title="Google Drive" blurb="A folder of CSVs in your own Drive, using the drive.file scope so the app only sees what it created. Share the folder to collaborate." />
+      <Target id="drive" title="Google Drive" blurb="A folder of CSVs in Drive, using the drive.file scope. Create your own folder, or join one someone shared with you, to collaborate from anywhere." />
       <Target id="http" title="Self-hosted" blurb="Any endpoint that answers GET and PUT per file — the bundled data server, Nextcloud WebDAV, or your own. Nothing touches Google." />
 
       {error && <div className="mb-note" style={{ marginTop: 12 }}>{error}</div>}
@@ -1148,16 +1223,33 @@ function StorageView({ config, setConfig, adapter, sync, state, pending, conflic
               onChange={(e) => setDraft({ ...draft, clientId: e.target.value })} onBlur={() => apply({ clientId: (draft.clientId || "").trim() })} />
           </div>
           <div className="mb-field">
-            <label className="mb-label">Folder name</label>
-            <input className="mb-input" value={draft.folderName || ""} onChange={(e) => setDraft({ ...draft, folderName: e.target.value })}
-              onBlur={() => apply({ folderName: (draft.folderName || "").trim() || "Mealboard" })} />
+            <label className="mb-label">Picker API key <span style={{ textTransform: "none", letterSpacing: 0 }}>— only needed to join someone else's folder</span></label>
+            <input className="mb-input" value={draft.pickerApiKey || ""} placeholder="AIza…"
+              onChange={(e) => setDraft({ ...draft, pickerApiKey: e.target.value })} onBlur={() => apply({ pickerApiKey: (draft.pickerApiKey || "").trim() })} />
           </div>
+
+          {config.driveFolderId ? (
+            <div className="mb-note good" style={{ marginBottom: 12 }}>
+              Following a shared folder: <strong>{config.folderName}</strong>.
+              {" "}<button className="mb-btn ghost" style={{ padding: "4px 10px", fontSize: 12 }} onClick={onLeaveDrive}>Use my own folder instead</button>
+            </div>
+          ) : (
+            <div className="mb-field">
+              <label className="mb-label">Folder name</label>
+              <input className="mb-input" value={draft.folderName || ""} onChange={(e) => setDraft({ ...draft, folderName: e.target.value })}
+                onBlur={() => apply({ folderName: (draft.folderName || "").trim() || "Mealboard" })} />
+            </div>
+          )}
+
           <div className="mb-two">
             {adapter.connected()
               ? <button className="mb-btn ghost" onClick={onDisconnect}>Disconnect</button>
-              : <button className="mb-btn" disabled={!config.clientId} onClick={onConnect}>Connect</button>}
+              : <button className="mb-btn" disabled={!config.clientId} onClick={onConnect}>{config.driveFolderId ? "Reconnect" : "Connect"}</button>}
             <button className="mb-btn ghost" disabled={!adapter.connected()} onClick={onSync}>Sync now</button>
           </div>
+          <button className="mb-btn ghost" style={{ width: "100%", marginTop: 8 }} disabled={!config.clientId || !config.pickerApiKey} onClick={onJoinDrive}>
+            Join a shared folder…
+          </button>
           {adapter.connected() && (
             <>
               <div style={{ marginTop: 12 }}>
@@ -1174,7 +1266,8 @@ function StorageView({ config, setConfig, adapter, sync, state, pending, conflic
             </>
           )}
           <div className="mb-note" style={{ marginTop: 12, marginBottom: 0 }}>
-            Add <code>{origin || "your site origin"}</code> to the OAuth client's authorised JavaScript origins — origin only, no path. Google blocks OAuth from sandboxed frames, so this needs the deployed site.
+            Add <code>{origin || "your site origin"}</code> to the OAuth client's authorised JavaScript origins, and to the Picker API key's website restrictions — origin only, no path. Google blocks OAuth from sandboxed frames, so this needs the deployed site.
+            To collaborate: the owner picks <strong>Connect</strong> and <strong>Share by link</strong>; everyone else pastes in the same client ID (and a Picker API key) and picks <strong>Join a shared folder…</strong> to select it from "Shared with me" — a plain link alone won't let their app find it.
           </div>
         </div>
       )}
@@ -1277,7 +1370,7 @@ function sampleState(base) {
 /* App                                                                */
 /* ================================================================== */
 
-const defaultConfig = { target: "local", clientId: "", folderName: "Mealboard", httpBase: "", httpToken: "", httpUser: "", httpPass: "", autoSync: true };
+const defaultConfig = { target: "local", clientId: "", pickerApiKey: "", folderName: "Mealboard", driveFolderId: "", httpBase: "", httpToken: "", httpUser: "", httpPass: "", autoSync: true };
 
 export default function App() {
   /* Layer 1 — the live copy. Seeded synchronously from layer 2. */
@@ -1386,6 +1479,27 @@ export default function App() {
   };
 
   const disconnect = () => { adapterRef.current?.disconnect?.(); setSync({ status: "idle", at: 0 }); setConflicts([]); };
+
+  const joinDrive = async () => {
+    setError(""); setSync((s) => ({ ...s, status: "busy" }));
+    try {
+      const ad = buildAdapter(config);
+      const picked = await ad.joinSharedFolder();
+      adapterRef.current = ad;
+      setConfig({ ...config, driveFolderId: picked.id, folderName: picked.name || config.folderName });
+      await runSync(false);
+    } catch (e) {
+      setSync((s) => ({ ...s, status: "bad" }));
+      setError(e.message || String(e));
+    }
+  };
+
+  const leaveDriveFolder = () => {
+    adapterRef.current?.disconnect?.();
+    setConfig({ ...config, driveFolderId: "" });
+    setSync({ status: "idle", at: 0 });
+    setConflicts([]);
+  };
 
   const wipeCache = () => {
     cache.del(CACHE_KEY); cache.del(BASE_KEY);
@@ -1519,7 +1633,7 @@ export default function App() {
         {view === "storage" && (
           <StorageView config={config} setConfig={setConfig} adapter={adapterRef.current} sync={sync} state={state}
             pending={pending} conflicts={conflicts} error={error}
-            onConnect={connect} onDisconnect={disconnect} onSync={() => runSync(false)}
+            onConnect={connect} onDisconnect={disconnect} onJoinDrive={joinDrive} onLeaveDrive={leaveDriveFolder} onSync={() => runSync(false)}
             onShare={(on) => adapterRef.current.share?.(on).catch((e) => setError(e.message))}
             onWipeCache={wipeCache} />
         )}

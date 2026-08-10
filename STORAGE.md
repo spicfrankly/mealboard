@@ -64,8 +64,12 @@ device had not seen yet, and would resurrect on the next sync.
 ## Choosing
 
 - **This device** — one person, one phone, no setup. Export the CSVs for backup.
-- **Google Drive** — a household that already lives in Google; sharing the
-  folder is the whole access model.
+- **Google Drive** — a household that already lives in Google. The owner
+  connects and shares the folder by link; everyone else joins it through
+  the Picker flow in Storage settings rather than typing the same folder
+  name — the `drive.file` scope only grants an app access to a folder
+  when the user explicitly picks it, so a plain shared link never becomes
+  visible to another account's own folder search.
 - **Self-hosted** — you want the data on your own hardware and Google nowhere
   near it.
 
