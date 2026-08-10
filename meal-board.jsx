@@ -1465,10 +1465,16 @@ function IngredientsView({ ingredients, stock, entriesAll, d, open, toggle, goto
 /* Storage view                                                       */
 /* ================================================================== */
 
-function StorageView({ config, setConfig, adapter, sync, state, pending, conflicts, error, p2pPeers, syncLink, roster, missing, onInvite, onInviteLink, onCancelInvite, onConnect, onDisconnect, onJoinDrive, onLeaveDrive, onSync, onShare, onWipeCache }) {
+function StorageView({ config, setConfig, adapter, sync, state, pending, conflicts, error, p2pPeers, syncLink, roster, missing, onInvite, onInviteLink, onCancelInvite, onUpdateSelf, onConnect, onDisconnect, onJoinDrive, onLeaveDrive, onSync, onShare, onWipeCache }) {
   const [draft, setDraft] = useState(config);
   useEffect(() => setDraft(config), [config]);
   const [newContact, setNewContact] = useState({ name: "", phone: "" });
+  const selfEntry = roster?.[config.p2pMemberId];
+  const [selfDraft, setSelfDraft] = useState({ name: "", phone: "" });
+  useEffect(() => {
+    setSelfDraft({ name: selfEntry?.name || "", phone: selfEntry?.phone || "" });
+  }, [selfEntry?.name, selfEntry?.phone, config.p2pMemberId]);
+  const applySelf = () => onUpdateSelf({ name: selfDraft.name.trim(), phone: selfDraft.phone.trim() });
   const [invite, setInvite] = useState(null);
   const [inviteBusy, setInviteBusy] = useState(false);
   const [copied, setCopied] = useState("");
@@ -1680,6 +1686,17 @@ function StorageView({ config, setConfig, adapter, sync, state, pending, conflic
                     <span className="mb-pill">{pend ? "pending" : "confirmed"}</span>
                     {!self && !pend && <span className="mb-pill">{behind.has(m.memberId) ? "needs update" : "up to date"}</span>}
                   </div>
+                  {self && (
+                    <div style={{ padding: "0 11px 11px" }}>
+                      <div className="mb-two">
+                        <input className="mb-input" placeholder="Your name" value={selfDraft.name}
+                          onChange={(e) => setSelfDraft({ ...selfDraft, name: e.target.value })} onBlur={applySelf} />
+                        <input className="mb-input" type="tel" placeholder="+15550100" value={selfDraft.phone}
+                          onChange={(e) => setSelfDraft({ ...selfDraft, phone: e.target.value })} onBlur={applySelf} />
+                      </div>
+                      {!m.phone && <div className="mb-note" style={{ marginTop: 8 }}>Add your name and number — without a number, nobody else on this plan can text you an update.</div>}
+                    </div>
+                  )}
                   {!self && !pend && (
                     <div className="mb-two" style={{ padding: "0 11px 11px" }}>
                       <a className="mb-btn ghost" style={{ textDecoration: "none", opacity: syncLink && m.phone ? 1 : 0.45, pointerEvents: syncLink && m.phone ? "auto" : "none" }}
@@ -2128,6 +2145,22 @@ export default function App() {
     return inviteLink(entry, next);
   };
 
+  /* The self entry is minted blank on connect (see above) — nothing ever
+     prompted the creator, or anyone who joined on the bare passphrase, for
+     their own name or number, so they sat on the roster forever as
+     "Unnamed" with no way for anyone else to text them. */
+  const updateSelf = ({ name, phone }) => {
+    const memberId = config.p2pMemberId;
+    if (!memberId) return;
+    setRoster((r) => {
+      const mine = r[memberId];
+      if (!mine) return r;
+      const n = (name ?? mine.name ?? "").trim(), p = (phone ?? mine.phone ?? "").trim();
+      if (mine.name === n && mine.phone === p) return r;
+      return { ...r, [memberId]: { ...mine, name: n, phone: p, updatedAt: now() } };
+    });
+  };
+
   /* A tombstone, not a removal: a deleted key would simply come back on the
      next merge. It revokes nothing — they still have the passphrase. */
   const cancelInvite = (memberId) => setRoster((r) => {
@@ -2300,7 +2333,7 @@ export default function App() {
         {view === "storage" && (
           <StorageView config={config} setConfig={setConfig} adapter={adapterRef.current} sync={sync} state={state}
             pending={pending} conflicts={conflicts} error={error} p2pPeers={p2pPeers} syncLink={syncLink}
-            roster={roster} missing={missing} onInvite={createInvite} onInviteLink={inviteLink} onCancelInvite={cancelInvite}
+            roster={roster} missing={missing} onInvite={createInvite} onInviteLink={inviteLink} onCancelInvite={cancelInvite} onUpdateSelf={updateSelf}
             onConnect={connect} onDisconnect={disconnect} onJoinDrive={joinDrive} onLeaveDrive={leaveDriveFolder} onSync={() => runSync(false)}
             onShare={(on) => adapterRef.current.share?.(on).catch((e) => setError(e.message))}
             onWipeCache={wipeCache} />
