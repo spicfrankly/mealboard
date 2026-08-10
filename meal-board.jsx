@@ -1,6 +1,8 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import * as Y from "yjs";
 import { WebrtcProvider } from "y-webrtc";
+import qrcode from "qrcode-generator";
+import jsQR from "jsqr";
 
 /* ==================================================================
    Mealboard
@@ -935,6 +937,79 @@ function CatIcon({ category }) {
   );
 }
 
+function QrCode({ text, size }) {
+  const ref = useRef(null);
+  useEffect(() => {
+    const canvas = ref.current;
+    if (!canvas || !text) return;
+    const qr = qrcode(0, "M");
+    qr.addData(text);
+    qr.make();
+    const n = qr.getModuleCount(), cell = Math.max(1, Math.floor(size / n));
+    canvas.width = cell * n; canvas.height = cell * n;
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = "#000";
+    for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) if (qr.isDark(r, c)) ctx.fillRect(c * cell, r * cell, cell, cell);
+  }, [text, size]);
+  return <canvas ref={ref} style={{ width: size, height: size, borderRadius: 10 }} aria-label="QR code" />;
+}
+
+function QrScanner({ onDecode, onClose }) {
+  const videoRef = useRef(null);
+  const [err, setErr] = useState("");
+
+  useEffect(() => {
+    let stream = null, raf = null, stopped = false;
+    (async () => {
+      if (!navigator.mediaDevices?.getUserMedia) { setErr("This browser has no camera access — use Copy code instead."); return; }
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+      } catch (e) {
+        setErr(e.name === "NotAllowedError" ? "Camera access was denied — allow it in the browser's site settings, or use Copy code instead."
+          : "Could not open the camera — " + (e.message || e.name));
+        return;
+      }
+      if (stopped) { stream.getTracks().forEach((t) => t.stop()); return; }
+      const video = videoRef.current;
+      video.srcObject = stream;
+      await video.play().catch(() => {});
+      const canvas = document.createElement("canvas");
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
+      const tick = () => {
+        if (stopped) return;
+        if (video.readyState === video.HAVE_ENOUGH_DATA) {
+          canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+          const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          const code = jsQR(img.data, img.width, img.height);
+          if (code?.data) { onDecode(code.data); return; }
+        }
+        raf = requestAnimationFrame(tick);
+      };
+      raf = requestAnimationFrame(tick);
+    })();
+    return () => { stopped = true; if (raf) cancelAnimationFrame(raf); stream?.getTracks().forEach((t) => t.stop()); };
+  }, [onDecode]);
+
+  return (
+    <div className="mb-scrim" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="mb-sheet" role="dialog" aria-modal="true">
+        <div className="mb-sheet-head">
+          <div className="mb-sheet-title">Scan QR code</div>
+          <button className="mb-x" onClick={onClose} aria-label="Close">✕</button>
+        </div>
+        {err ? <div className="mb-note">{err}</div> : (
+          <>
+            <video ref={videoRef} playsInline muted style={{ width: "100%", borderRadius: 12, background: "#000", display: "block" }} />
+            <p className="mb-none" style={{ marginTop: 10 }}>Point the camera at the passphrase QR code shown on the other device.</p>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function Disclosure({ id, open, onToggle, label, children }) {
   return (
     <div className="mb-disc">
@@ -1397,6 +1472,8 @@ function StorageView({ config, setConfig, adapter, sync, state, pending, conflic
   const [invite, setInvite] = useState(null);
   const [inviteBusy, setInviteBusy] = useState(false);
   const [copied, setCopied] = useState("");
+  const [showQR, setShowQR] = useState(false);
+  const [showScan, setShowScan] = useState(false);
   const origin = typeof window !== "undefined" ? window.location.origin : "";
   const apply = (patch) => setConfig({ ...config, ...patch });
 
@@ -1557,8 +1634,12 @@ function StorageView({ config, setConfig, adapter, sync, state, pending, conflic
                 onChange={(e) => setDraft({ ...draft, p2pPassphrase: e.target.value })}
                 onBlur={() => apply({ p2pPassphrase: (draft.p2pPassphrase || "").trim() })} />
             </div>
-            <div className="mb-note">
-              This passphrase is the whole security boundary. Everyone typing exactly the same words lands in the same room and can read and change the plan; anyone else cannot reach it at all. Pick something long, share it in person or over a channel you trust, and never through the same text message as a link.
+            <div className="mb-two">
+              <button className="mb-btn ghost" disabled={!config.p2pPassphrase} onClick={() => setShowQR(true)}>Show QR code</button>
+              <button className="mb-btn ghost" onClick={() => setShowScan(true)}>Scan QR code</button>
+            </div>
+            <div className="mb-note" style={{ marginTop: 8 }}>
+              This passphrase is the whole security boundary. Everyone typing exactly the same words lands in the same room and can read and change the plan; anyone else cannot reach it at all. Pick something long, share it in person — aloud, written down, or as a QR code — or over a channel you trust, and never through the same text message as a link.
             </div>
             <div className="mb-two">
               {adapter.connected()
@@ -1678,6 +1759,30 @@ function StorageView({ config, setConfig, adapter, sync, state, pending, conflic
         <div className="mb-files">{TABLE_NAMES.map((t) => <button key={t} onClick={() => download(t)}>↓ {TABLES[t].file}</button>)}</div>
         <button className="mb-btn danger" style={{ width: "100%", marginTop: 12 }} onClick={onWipeCache}>Clear this device's cache</button>
       </div>
+
+      {showQR && (
+        <div className="mb-scrim" onClick={(e) => { if (e.target === e.currentTarget) setShowQR(false); }}>
+          <div className="mb-sheet" role="dialog" aria-modal="true" style={{ textAlign: "center" }}>
+            <div className="mb-sheet-head">
+              <div className="mb-sheet-title">Room passphrase</div>
+              <button className="mb-x" onClick={() => setShowQR(false)} aria-label="Close">✕</button>
+            </div>
+            <div style={{ display: "flex", justifyContent: "center", marginBottom: 14 }}>
+              <QrCode text={config.p2pPassphrase} size={240} />
+            </div>
+            <p className="mb-none">Showing this is the same as saying the passphrase out loud — only for someone you're handing the room to in person. Never screenshot it or post it anywhere.</p>
+          </div>
+        </div>
+      )}
+
+      {showScan && (
+        <QrScanner onClose={() => setShowScan(false)} onDecode={(text) => {
+          const v = text.trim();
+          setDraft({ ...draft, p2pPassphrase: v });
+          apply({ p2pPassphrase: v });
+          setShowScan(false);
+        }} />
+      )}
     </div>
   );
 }

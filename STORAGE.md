@@ -51,6 +51,15 @@ everyone moves to a new room together, and stale copies of the plan stay on
 whatever devices already had them. Share it in person or over a channel you
 trust, and never in the same message as a sync link.
 
+Storage also offers a QR code as a third way to hand over the same secret —
+show it on one screen, scan it with another device's camera, and the
+passphrase field fills itself in. It's exactly equivalent to reading the
+words aloud, not a separate channel: scanning happens entirely on-device
+(the frame is decoded locally, nothing is uploaded), but the code on screen
+is just the passphrase rendered as pixels, so the same rule applies —
+show it only to someone you're handing the room to in person, never post
+or screenshot it.
+
 The passphrase itself never leaves the device. It is used three ways:
 
 - `SHA-256("mealboard-room-v1:" + passphrase)`, truncated, is the room name
