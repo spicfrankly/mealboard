@@ -233,6 +233,7 @@ const CACHE_KEY = "mealboard.cache";
 const BASE_KEY = "mealboard.baseline";
 const CONF_KEY = "mealboard.config";
 const ROSTER_KEY = "mealboard.roster";
+const DEVICE_KEY = "mealboard.devicekey";
 
 const TABLES = {
   ingredients: { file: "ingredients.csv", cols: ["id", "name", "category", "unit", "updated_at", "deleted"] },
@@ -698,9 +699,12 @@ function tablesIntoDoc(doc, tables) {
        decides per entry, so merging two snapshots is order-independent and
        never cares which throwaway doc produced which write. --- */
 
+/* `provisional` marks an entry this device invented about itself from a join
+   link, before the plan it refers to has ever been seen. It is a placeholder
+   for the inviter's real record, and always loses to it — see rosterIntoDoc. */
 const memberEntry = (patch) => ({
-  memberId: "", name: "", phone: "", status: "pending", inviteCode: "", invitedBy: "",
-  invitedAt: 0, confirmedAt: 0, lastSeenEditAt: 0, lastSeenAt: 0, updatedAt: now(), ...patch,
+  memberId: "", name: "", email: "", phone: "", publicKey: "", status: "pending", inviteCode: "", invitedBy: "",
+  provisional: false, invitedAt: 0, confirmedAt: 0, lastSeenEditAt: 0, lastSeenAt: 0, updatedAt: now(), ...patch,
 });
 
 function docToRoster(doc) {
@@ -715,7 +719,13 @@ function rosterIntoDoc(doc, roster) {
     Object.values(roster || {}).forEach((e) => {
       if (!e || !e.memberId) return;
       const cur = m.get(e.memberId);
-      if (sameRecord(cur, e) || (cur && num(cur.updatedAt) >= num(e.updatedAt))) return;
+      if (sameRecord(cur, e)) return;
+      /* A guess about myself yields to the plan's record of me, whichever
+         was written later: the provisional entry is stamped now() and would
+         otherwise permanently outrank the inviter's older, real one. */
+      if (cur && !cur.provisional && e.provisional) return;
+      if (cur && cur.provisional && !e.provisional) { m.set(e.memberId, e); return; }
+      if (cur && num(cur.updatedAt) >= num(e.updatedAt)) return;
       m.set(e.memberId, e);
     });
   });
@@ -751,17 +761,37 @@ function noteSelfSeen(setRoster, memberId, state) {
   });
 }
 
-/* Confirming a code proves the opener received the text sent to that number,
-   nothing more — not who owns the phone, and not access, which the
-   passphrase alone still decides. */
-function resolveInvite(roster, memberId, code) {
+/* Confirming a code proves the opener received the email sent to that
+   address, nothing more — not who owns the mailbox, and not access, which
+   the passphrase still decides for the live room. It also carries this
+   device's own public key onto the entry, since claiming a memberId and
+   publishing the key that lets others encrypt to it are the same act. */
+function resolveInvite(roster, memberId, code, publicKey) {
   const e = (roster || {})[memberId];
-  if (!e) return { ok: false, reason: "That invite is not in this plan yet. Ask whoever invited you to send a fresh link." };
+  if (!e) return { ok: false, unknown: true, reason: "This invite is for a plan this device has not seen yet. Open the update file from the same email, if one is attached, or wait for the person who invited you to confirm your reply — the invite settles itself once it does." };
   if (e.status === "cancelled") return { ok: false, reason: "That invite was cancelled. Ask for a new one." };
   if (String(e.inviteCode) !== String(code)) return { ok: false, reason: "That invite code does not match the one in the plan. Ask for a new invite." };
-  if (e.status === "confirmed") return { ok: true, memberId, roster };
+  /* Never confirm against a provisional entry: it is this device's own guess
+     about itself, so doing so would let an invitee mark itself confirmed
+     while the inviter still has no idea it exists. Only the inviter's real
+     record, arriving with an update, can settle this. */
+  if (e.provisional) return { ok: true, memberId, roster, stillProvisional: true };
+  if (e.status === "confirmed" && (e.publicKey || !publicKey)) return { ok: true, memberId, roster };
   const t = now();
-  return { ok: true, memberId, roster: { ...roster, [memberId]: { ...e, status: "confirmed", confirmedAt: t, lastSeenAt: t, updatedAt: t } } };
+  return { ok: true, memberId, roster: { ...roster, [memberId]: { ...e, status: "confirmed", publicKey: publicKey || e.publicKey, confirmedAt: e.confirmedAt || t, lastSeenAt: t, updatedAt: t } } };
+}
+
+/* The other half of first contact: whoever sent the invite has to learn the
+   invitee's public key before they can encrypt anything to them. That
+   arrives as a plain reply link — no secret in it, since a public key isn't
+   one, and the invite code is what proves it belongs to that invitee. */
+function confirmReply(roster, memberId, code, publicKey) {
+  const e = (roster || {})[memberId];
+  if (!e) return { ok: false, reason: "That invite isn't on this plan. Use the original invite link to start over." };
+  if (e.status === "cancelled") return { ok: false, reason: "That invite was cancelled." };
+  if (String(e.inviteCode) !== String(code)) return { ok: false, reason: "That confirmation code doesn't match the invite. Ask for a new invite." };
+  const t = now();
+  return { ok: true, roster: { ...roster, [memberId]: { ...e, status: "confirmed", publicKey: publicKey || e.publicKey, confirmedAt: e.confirmedAt || t, updatedAt: t } } };
 }
 
 /* SignalingConn sends the room name to the public signalling server in
@@ -785,53 +815,223 @@ const unbase64url = (s) => {
   return out;
 };
 
-/* Same PBKDF2 → AES-GCM shape y-webrtc uses for the room, deliberately a
-   different salt so the link key and the room key stay independent. */
-async function smsKey(passphrase) {
-  const km = await crypto.subtle.importKey("raw", new TextEncoder().encode(passphrase), "PBKDF2", false, ["deriveKey"]);
-  return crypto.subtle.deriveKey(
-    { name: "PBKDF2", salt: new TextEncoder().encode("mealboard-sms-v1"), iterations: 100000, hash: "SHA-256" },
-    km, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+/* --- per-member encryption ------------------------------------------------
+   The passphrase used to be the whole security boundary for every plan
+   snapshot: one shared AES key, so removing someone from the roster never
+   actually revoked anything — they kept the words and could still open
+   every future link. Content now goes to a per-member ECDH keypair instead,
+   generated once per device and never leaving it whole. The passphrase is
+   left doing only what a shared secret is actually good for here: letting
+   peers find each other on the WebRTC room (deriveRoomName above).
+
+   Bootstrapping a new member's key needs one plain round trip, because a
+   key nobody has can't encrypt anything: the invite link carries no plan
+   data (nothing to protect), the invitee's reply link carries their public
+   key back in the clear (a public key isn't a secret — the invite code is
+   what proves the reply is genuine), and only after that has landed can
+   anyone build an update this new member can open.                    --- */
+
+/* One identity per device, kept only in this browser's cache and never
+   swapped with anyone — only its public half ever leaves, riding inside a
+   roster entry or a bare reply link. */
+async function loadDeviceKeyPair() {
+  let jwk;
+  try { jwk = JSON.parse(cache.get(DEVICE_KEY) || "null"); } catch { /* regenerate below */ }
+  if (!jwk) {
+    const pair = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
+    jwk = await crypto.subtle.exportKey("jwk", pair.privateKey);
+    cache.set(DEVICE_KEY, JSON.stringify(jwk));
+  }
+  const privateKey = await crypto.subtle.importKey("jwk", jwk, { name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
+  const { d, key_ops, ...pubJwk } = jwk;
+  const publicKey = await crypto.subtle.importKey("jwk", { ...pubJwk, key_ops: [] }, { name: "ECDH", namedCurve: "P-256" }, true, []);
+  return { privateKey, publicKey };
 }
 
-async function encodeSyncPayload(passphrase, update) {
+const importECDHRaw = (bytes) => crypto.subtle.importKey("raw", bytes, { name: "ECDH", namedCurve: "P-256" }, true, []);
+const exportECDHRaw = async (key) => new Uint8Array(await crypto.subtle.exportKey("raw", key));
+const publicKeyB64 = async (key) => base64url(await exportECDHRaw(key));
+
+/* HKDF over an ECDH shared secret, salted per recipient so the same
+   ephemeral pair never derives the same wrapping key twice. */
+async function wrapContentKey(ephemeralPrivate, recipientPublic, memberId, contentKeyRaw) {
+  const bits = await crypto.subtle.deriveBits({ name: "ECDH", public: recipientPublic }, ephemeralPrivate, 256);
+  const hkdfKey = await crypto.subtle.importKey("raw", bits, "HKDF", false, ["deriveKey"]);
+  const aesKey = await crypto.subtle.deriveKey(
+    { name: "HKDF", hash: "SHA-256", salt: new TextEncoder().encode(memberId), info: new TextEncoder().encode("mealboard-wrap-v1") },
+    hkdfKey, { name: "AES-GCM", length: 256 }, false, ["encrypt"]);
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const cipher = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, await smsKey(passphrase), update));
-  const packed = new Uint8Array(iv.length + cipher.length);
-  packed.set(iv, 0);
-  packed.set(cipher, iv.length);
-  return base64url(packed);
+  const cipher = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, aesKey, contentKeyRaw));
+  return { iv, cipher };
 }
 
-async function decodeSyncPayload(passphrase, payload) {
-  const packed = unbase64url(payload);
-  if (packed.length <= 12) throw new Error("This update link is truncated or damaged");
-  return new Uint8Array(await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: packed.slice(0, 12) }, await smsKey(passphrase), packed.slice(12)));
+async function unwrapContentKey(devicePrivate, ephemeralPublic, memberId, iv, cipher) {
+  const bits = await crypto.subtle.deriveBits({ name: "ECDH", public: ephemeralPublic }, devicePrivate, 256);
+  const hkdfKey = await crypto.subtle.importKey("raw", bits, "HKDF", false, ["deriveKey"]);
+  const aesKey = await crypto.subtle.deriveKey(
+    { name: "HKDF", hash: "SHA-256", salt: new TextEncoder().encode(memberId), info: new TextEncoder().encode("mealboard-wrap-v1") },
+    hkdfKey, { name: "AES-GCM", length: 256 }, false, ["decrypt"]);
+  return new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv }, aesKey, cipher));
 }
 
-/* The link carries the whole doc, not a diff: applying it is idempotent
-   and order-independent, so nothing has to track what a contact already
-   received — which a text message could never tell us anyway. It is built
-   from live state rather than the adapter's doc so it always matches what
-   the sender can see on screen, connected or not. */
-async function buildSyncLink(passphrase, state, roster) {
+/* --- the container ---------------------------------------------------
+   One random content key encrypts the plan once; that key is then wrapped
+   separately for every active member who has a public key on the roster,
+   using a single ephemeral keypair for the whole message. Whoever sent it
+   can always reopen it too, since they're a recipient of their own message.
+   A text message caps out around 1500 characters and phones clip a longer
+   one silently, so this never travels as a link — it goes as a file, over
+   whatever pipe is at hand: the OS share sheet into a mail draft on a
+   phone, a plain download plus a pre-addressed draft elsewhere, or the
+   `?sync=` query string for a quick same-device copy/paste.
+
+     MAGIC(5) | ephemeral pubkey (65) | recipient count (1)
+     recipients[]: memberId length (1) + memberId + wrap IV (12) + wrap cipher (48)
+     main IV (12) | main ciphertext                                    --- */
+
+const MB_MAGIC = "MBUP2";
+const UPDATE_EXT = ".mbupdate";
+const UPDATE_MIME = "application/octet-stream";
+
+async function buildUpdateBytes(state, roster) {
   const doc = new Y.Doc();
   tablesIntoDoc(doc, stateToTables(state));
   rosterIntoDoc(doc, roster);
-  const payload = await encodeSyncPayload(passphrase, Y.encodeStateAsUpdate(doc));
+  const update = Y.encodeStateAsUpdate(doc);
   doc.destroy();
-  const loc = window.location;
-  return loc.origin + loc.pathname + "?sync=" + payload;
+
+  const recipients = Object.values(roster || {}).filter((m) => m.status !== "cancelled" && m.publicKey);
+  if (recipients.length === 0) throw new Error("Nobody on the roster has a key yet — invite someone, or wait for a reply, before sending an update.");
+
+  const contentKey = crypto.getRandomValues(new Uint8Array(32));
+  const contentAesKey = await crypto.subtle.importKey("raw", contentKey, { name: "AES-GCM" }, false, ["encrypt"]);
+  const mainIv = crypto.getRandomValues(new Uint8Array(12));
+  const mainCipher = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv: mainIv }, contentAesKey, update));
+
+  const ephemeral = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
+  const ephemeralPub = await exportECDHRaw(ephemeral.publicKey);
+
+  const wraps = [];
+  for (const m of recipients) {
+    const recipientPub = await importECDHRaw(unbase64url(m.publicKey));
+    const { iv, cipher } = await wrapContentKey(ephemeral.privateKey, recipientPub, m.memberId, contentKey);
+    wraps.push({ memberId: m.memberId, idBytes: new TextEncoder().encode(m.memberId), iv, cipher });
+  }
+
+  const magic = new TextEncoder().encode(MB_MAGIC);
+  let len = magic.length + ephemeralPub.length + 1;
+  wraps.forEach((w) => { len += 1 + w.idBytes.length + w.iv.length + w.cipher.length; });
+  len += mainIv.length + mainCipher.length;
+
+  const out = new Uint8Array(len);
+  let o = 0;
+  out.set(magic, o); o += magic.length;
+  out.set(ephemeralPub, o); o += ephemeralPub.length;
+  out[o++] = wraps.length;
+  wraps.forEach((w) => {
+    out[o++] = w.idBytes.length;
+    out.set(w.idBytes, o); o += w.idBytes.length;
+    out.set(w.iv, o); o += w.iv.length;
+    out.set(w.cipher, o); o += w.cipher.length;
+  });
+  out.set(mainIv, o); o += mainIv.length;
+  out.set(mainCipher, o);
+  return out;
 }
 
-async function decodeSyncState(passphrase, payload) {
+async function readUpdateBytes(devicePrivate, selfMemberId, buffer) {
+  const bytes = new Uint8Array(buffer);
+  const magic = new TextEncoder().encode(MB_MAGIC);
+  if (bytes.length < magic.length + 65 + 1) throw new Error("That update file is empty or truncated.");
+  if (new TextDecoder().decode(bytes.slice(0, magic.length)) !== MB_MAGIC) {
+    throw new Error("That is not a Mealboard update file.");
+  }
+  let o = magic.length;
+  const ephemeralPub = await importECDHRaw(bytes.slice(o, o + 65)); o += 65;
+  const count = bytes[o++];
+  let mine = null;
+  for (let i = 0; i < count; i++) {
+    const idLen = bytes[o++];
+    const memberId = new TextDecoder().decode(bytes.slice(o, o + idLen)); o += idLen;
+    const iv = bytes.slice(o, o + 12); o += 12;
+    const cipher = bytes.slice(o, o + 48); o += 48;
+    if (memberId === selfMemberId) mine = { iv, cipher };
+  }
+  if (!mine) throw new Error("This update wasn't encrypted for you — your key may not have reached the sender yet. Send your reply link if you haven't, then ask them to resend.");
+  const mainIv = bytes.slice(o, o + 12); o += 12;
+  const mainCipher = bytes.slice(o);
+  const contentKey = await unwrapContentKey(devicePrivate, ephemeralPub, selfMemberId, mine.iv, mine.cipher);
+  const contentAesKey = await crypto.subtle.importKey("raw", contentKey, { name: "AES-GCM" }, false, ["decrypt"]);
+  const plain = new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv: mainIv }, contentAesKey, mainCipher));
   const doc = new Y.Doc();
-  Y.applyUpdate(doc, await decodeSyncPayload(passphrase, payload));
+  Y.applyUpdate(doc, plain);
   const s = tablesToState(docToTables(doc)), roster = docToRoster(doc);
   doc.destroy();
   return { state: s, roster };
 }
+
+const updateFileName = () => `mealboard-${iso(new Date())}${UPDATE_EXT}`;
+
+/* Returns how it went, so the UI can tell the truth about what just
+   happened rather than claiming an email was sent.
+
+   Both exits here are gated on a user gesture by the browser, and a gesture
+   only survives synchronous code: an `await` before this point makes Chrome
+   refuse the share sheet outright and silently drop the mailto: navigation.
+   So the payload must already be built when this is called — see the
+   debounced builder in App, which keeps the bytes ready in a ref. */
+async function shareUpdate(bytes, { to, subject, body }) {
+  const file = new File([bytes], updateFileName(), { type: UPDATE_MIME });
+  if (navigator.canShare?.({ files: [file] })) {
+    try {
+      /* not awaited before the call: navigator.share must be *invoked*
+         inside the gesture, though its promise may settle later */
+      await navigator.share({ files: [file], title: subject, text: body });
+      return "shared";
+    } catch (e) {
+      if (e?.name === "AbortError") return "cancelled";
+      /* fall through to the download path */
+    }
+  }
+  /* Appended before clicking: a detached anchor is enough for Chrome but
+     Safari and older Firefox ignore the download entirely, which on a phone
+     is the difference between an update being sendable and silently not. */
+  const url = URL.createObjectURL(file);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = file.name;
+  a.rel = "noopener";
+  a.style.display = "none";
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { a.remove(); URL.revokeObjectURL(url); }, 8000);
+  if (to) {
+    window.location.href = `mailto:${encodeURIComponent(to)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+  }
+  return "downloaded";
+}
+
+const mailtoLink = (to, subject, body) =>
+  `mailto:${to ? encodeURIComponent(to) : ""}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+
+const UPDATE_SUBJECT = "Mealboard — meal plan update";
+const updateBody = (name) =>
+  `${name ? name + ",\n\n" : ""}Here is the latest meal plan.\n\n` +
+  `Attach the mealboard update file that just downloaded, if it is not already attached, ` +
+  `then open it from Mealboard: Storage → Open update file.\n\n` +
+  `It's encrypted to your key specifically, not a shared passphrase, so nobody without your key on this roster can read it.`;
+
+const INVITE_SUBJECT = "Mealboard — you've been added to a meal plan";
+const inviteBody = (name, joinUrl, code) =>
+  `${name ? name + ",\n\n" : ""}You've been added to a shared meal plan.\n\n` +
+  `1. Open this link: ${joinUrl}\n` +
+  `2. It will offer a reply — send that back to me so I can start sending you updates.\n\n` +
+  `Your confirmation code is ${code}, in case you're asked for it. Nothing here needs the room passphrase — that's only for the live connection, and I'll give it to you separately if we set that up.`;
+
+const REPLY_SUBJECT = "Re: Mealboard invite — here's my key";
+const replyBody = (joinUrl) =>
+  `Here's my key so you can start sending me updates:\n\n${joinUrl}\n\n` +
+  `Open it from your end and I should show up as confirmed.`;
 
 function p2pAdapter(cfg) {
   const st = { doc: null, provider: null, peers: 0 };
@@ -1465,19 +1665,23 @@ function IngredientsView({ ingredients, stock, entriesAll, d, open, toggle, goto
 /* Storage view                                                       */
 /* ================================================================== */
 
-function StorageView({ config, setConfig, adapter, sync, state, pending, conflicts, error, p2pPeers, syncLink, roster, missing, onInvite, onInviteLink, onCancelInvite, onUpdateSelf, onConnect, onDisconnect, onJoinDrive, onLeaveDrive, onSync, onShare, onWipeCache }) {
+function StorageView({ config, setConfig, adapter, sync, state, pending, conflicts, error, p2pPeers, syncLink, updateSize, roster, missing, onInvite, onInviteLink, onCancelInvite, onUpdateSelf, onEmailUpdate, onImportUpdate, onEmailReply, onClaimIdentity, replyUrl, onConnect, onDisconnect, onJoinDrive, onLeaveDrive, onSync, onShare, onWipeCache }) {
   const [draft, setDraft] = useState(config);
   useEffect(() => setDraft(config), [config]);
-  const [newContact, setNewContact] = useState({ name: "", phone: "" });
+  const [newContact, setNewContact] = useState({ name: "", email: "" });
   const selfEntry = roster?.[config.p2pMemberId];
-  const [selfDraft, setSelfDraft] = useState({ name: "", phone: "" });
+  const [selfDraft, setSelfDraft] = useState({ name: "", email: "" });
   useEffect(() => {
-    setSelfDraft({ name: selfEntry?.name || "", phone: selfEntry?.phone || "" });
-  }, [selfEntry?.name, selfEntry?.phone, config.p2pMemberId]);
-  const applySelf = () => onUpdateSelf({ name: selfDraft.name.trim(), phone: selfDraft.phone.trim() });
+    setSelfDraft({ name: selfEntry?.name || "", email: selfEntry?.email || "" });
+  }, [selfEntry?.name, selfEntry?.email, config.p2pMemberId]);
+  const applySelf = () => onUpdateSelf({ name: selfDraft.name.trim(), email: selfDraft.email.trim() });
   const [invite, setInvite] = useState(null);
   const [inviteBusy, setInviteBusy] = useState(false);
   const [copied, setCopied] = useState("");
+  const [sending, setSending] = useState("");
+  const [sent, setSent] = useState("");
+  const [claiming, setClaiming] = useState(false);
+  const importRef = useRef(null);
   const [showQR, setShowQR] = useState(false);
   const [showScan, setShowScan] = useState(false);
   const origin = typeof window !== "undefined" ? window.location.origin : "";
@@ -1486,12 +1690,8 @@ function StorageView({ config, setConfig, adapter, sync, state, pending, conflic
   const behind = new Set((missing || []).map((m) => m.memberId));
   const members = Object.values(roster || {}).filter((m) => m.status !== "cancelled").sort((a, b) =>
     (a.memberId === config.p2pMemberId ? -1 : b.memberId === config.p2pMemberId ? 1 : 0) ||
-    String(a.name || a.phone || "").localeCompare(String(b.name || b.phone || "")));
+    String(a.name || a.email || "").localeCompare(String(b.name || b.email || "")));
 
-  const smsHref = (phone) => `sms:${phone}?body=${encodeURIComponent("Mealboard plan update — open this to merge it: " + syncLink)}`;
-  const inviteHref = (inv) => `sms:${inv.phone}?body=${encodeURIComponent(
-    `Join our Mealboard plan: ${inv.url}\n` +
-    `Open it, then enter the passphrase I gave you separately, and this code if asked: ${inv.code}`)}`;
   const showInvite = async (make) => {
     setInviteBusy(true);
     try { const inv = await make(); if (inv) setInvite(inv); } finally { setInviteBusy(false); }
@@ -1506,8 +1706,10 @@ function StorageView({ config, setConfig, adapter, sync, state, pending, conflic
     const csv = toCSV(TABLES[t].cols, stateToTables(state)[t]);
     const url = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
     const a = document.createElement("a");
-    a.href = url; a.download = TABLES[t].file; a.click();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    a.href = url; a.download = TABLES[t].file; a.style.display = "none";
+    document.body.appendChild(a);       // Safari ignores a detached anchor
+    a.click();
+    setTimeout(() => { a.remove(); URL.revokeObjectURL(url); }, 1000);
   };
 
   const label = (c) => {
@@ -1540,7 +1742,7 @@ function StorageView({ config, setConfig, adapter, sync, state, pending, conflic
       <Target id="local" title="This device only" blurb="Cache is the source of truth. No account, no network, nothing leaves the browser. Clearing site data erases the plan — export the CSVs to keep a copy." />
       <Target id="drive" title="Google Drive" blurb="A folder of CSVs in Drive, using the drive.file scope. Create your own folder, or join one someone shared with you, to collaborate from anywhere." />
       <Target id="http" title="Self-hosted" blurb="Any endpoint that answers GET and PUT per file — the bundled data server, Nextcloud WebDAV, or your own. Nothing touches Google." />
-      <Target id="p2p" title="Peer-to-peer" blurb="Syncs directly with collaborators over WebRTC when you're both online, and via a text-message link when you're not. No account, no server — just a shared passphrase." />
+      <Target id="p2p" title="Peer-to-peer" blurb="Syncs directly with collaborators over WebRTC when you're both online, and by email when you're not. No account, no server — a shared passphrase for the live room, a personal key for everything it carries." />
 
       {error && <div className="mb-note" style={{ marginTop: 12 }}>{error}</div>}
 
@@ -1645,7 +1847,7 @@ function StorageView({ config, setConfig, adapter, sync, state, pending, conflic
               <button className="mb-btn ghost" onClick={() => setShowScan(true)}>Scan QR code</button>
             </div>
             <div className="mb-note" style={{ marginTop: 8 }}>
-              This passphrase is the whole security boundary. Everyone typing exactly the same words lands in the same room and can read and change the plan; anyone else cannot reach it at all. Pick something long, share it in person — aloud, written down, or as a QR code — or over a channel you trust, and never through the same text message as a link.
+              This passphrase only gets a device into the live room below — it finds other peers on WebRTC and lets them talk. It doesn't decrypt the plan; every update and every file is encrypted separately to each person's own key instead, so removing someone from the roster genuinely stops new updates reaching them, not just symbolically. Pick something long, share it in person — aloud, written down, or as a QR code — or over a channel you trust.
             </div>
             <div className="mb-two">
               {adapter.connected()
@@ -1656,7 +1858,6 @@ function StorageView({ config, setConfig, adapter, sync, state, pending, conflic
             <div style={{ marginTop: 12 }}>
               <div className="mb-kv"><span>Room</span><span>{adapter.describe()}</span></div>
               <div className="mb-kv"><span>Peers online</span><span>{adapter.connected() ? p2pPeers : "—"}</span></div>
-              <div className="mb-kv"><span>Update link</span><span>{syncLink ? Math.round(syncLink.length / 102.4) / 10 + " kB" : "—"}</span></div>
             </div>
             <div className="mb-note" style={{ marginTop: 12, marginBottom: 0 }}>
               Peers find each other through a public signalling relay, which only ever sees a one-way hash of the passphrase — never the words, never the plan. The plan itself travels straight between browsers.
@@ -1665,9 +1866,33 @@ function StorageView({ config, setConfig, adapter, sync, state, pending, conflic
 
           <div className="mb-panel">
             <div className="mb-group-head"><span className="mb-h">Roster</span><span className="mb-day-rule" /></div>
-            <p>Everyone on this plan, shared with the plan itself. Invite someone by text and they get a link plus a six-digit code; confirming it puts their name against the acknowledgements that follow. When nobody is online at the same time, send the plan as a link — it carries the whole plan encrypted with the same passphrase, and opening it twice changes nothing.</p>
+            <p>Everyone on this plan, each with their own key. Invite someone by email and they get a short join link and a six-digit code; opening it generates their key and a reply for them to send back, and once that reply lands they start receiving updates — encrypted to them specifically, not to a shared secret. When nobody is online at the same time, email the plan directly; it travels as an attachment, and opening it twice changes nothing.</p>
+            <div className="mb-two" style={{ marginBottom: 10 }}>
+              <button className="mb-btn" onClick={() => importRef.current?.click()}>Open update file</button>
+              <button className="mb-btn ghost" disabled={sending === "self" || !updateSize} onClick={async () => {
+                setSending("self");
+                try { setSent(await onEmailUpdate(null)); } finally { setSending(""); }
+              }}>{sending === "self" ? "Preparing…" : "Save update file"}</button>
+            </div>
+            <input ref={importRef} type="file" accept=".mbupdate,application/octet-stream" style={{ display: "none" }}
+              onChange={async (e) => {
+                const f = e.target.files?.[0];
+                e.target.value = "";
+                if (f) setSent(await onImportUpdate(f));
+              }} />
+            {sent && <div className="mb-note good" style={{ marginBottom: 10 }}>{sent}</div>}
+            <div className="mb-kv"><span>Update file</span><span>{updateSize ? Math.round(updateSize / 102.4) / 10 + " kB" : "—"}</span></div>
+
             {!config.p2pMemberId && (
-              <div className="mb-note">Press <strong>Start</strong> above once to take your own place on the roster. Until then nothing can be acknowledged for you.</div>
+              <div className="mb-note">
+                Take your place on the roster to get a key of your own. Everything below needs one: it's what updates are encrypted to, and what other people acknowledge against. No passphrase or connection required — that's only for live sync.
+                <div style={{ marginTop: 8 }}>
+                  <button className="mb-btn" disabled={claiming} onClick={async () => {
+                    setClaiming(true);
+                    try { await onClaimIdentity(); } finally { setClaiming(false); }
+                  }}>{claiming ? "Creating your key…" : "Create my key"}</button>
+                </div>
+              </div>
             )}
             {members.length === 0 && <div className="mb-none">Nobody on the roster yet.</div>}
             {members.map((m) => {
@@ -1677,9 +1902,9 @@ function StorageView({ config, setConfig, adapter, sync, state, pending, conflic
                 <div className="mb-row" key={m.memberId}>
                   <div className="mb-row-main">
                     <div className="mb-row-text">
-                      <div className="mb-row-name">{m.name || m.phone || "Unnamed"}{self ? " (you)" : ""}</div>
+                      <div className="mb-row-name">{m.name || m.email || "Unnamed"}{self ? " (you)" : ""}</div>
                       <div className="mb-row-sub">
-                        {m.phone ? m.phone + " · " : ""}
+                        {m.email ? m.email + " · " : m.phone ? m.phone + " · " : ""}
                         {pend ? "waiting to confirm — invited " + clock(m.invitedAt) : "last acknowledged " + clock(m.lastSeenAt)}
                       </div>
                     </div>
@@ -1691,16 +1916,30 @@ function StorageView({ config, setConfig, adapter, sync, state, pending, conflic
                       <div className="mb-two">
                         <input className="mb-input" placeholder="Your name" value={selfDraft.name}
                           onChange={(e) => setSelfDraft({ ...selfDraft, name: e.target.value })} onBlur={applySelf} />
-                        <input className="mb-input" type="tel" placeholder="+15550100" value={selfDraft.phone}
-                          onChange={(e) => setSelfDraft({ ...selfDraft, phone: e.target.value })} onBlur={applySelf} />
+                        <input className="mb-input" type="email" placeholder="you@example.com" value={selfDraft.email}
+                          onChange={(e) => setSelfDraft({ ...selfDraft, email: e.target.value })} onBlur={applySelf} />
                       </div>
-                      {!m.phone && <div className="mb-note" style={{ marginTop: 8 }}>Add your name and number — without a number, nobody else on this plan can text you an update.</div>}
+                      {!m.email && <div className="mb-note" style={{ marginTop: 8 }}>Add your name and email address — without one, nobody else on this plan can send you an update.</div>}
+                      {pend && (
+                        <div className="mb-note" style={{ marginTop: 8 }}>
+                          Waiting on whoever invited you to receive your key. If you haven't already, send it back to them.
+                          <div className="mb-two" style={{ marginTop: 8 }}>
+                            <button className="mb-btn" disabled={sending === "reply" || !replyUrl} onClick={async () => {
+                              setSending("reply");
+                              try { setSent(await onEmailReply()); } finally { setSending(""); }
+                            }}>{sending === "reply" ? "Preparing…" : "Email my key back"}</button>
+                            <button className="mb-btn ghost" disabled={!replyUrl} onClick={() => copy("reply", replyUrl)}>{copied === "reply" ? "Copied" : "Copy reply link"}</button>
+                          </div>
+                        </div>
+                      )}
                     </div>
                   )}
                   {!self && !pend && (
                     <div className="mb-two" style={{ padding: "0 11px 11px" }}>
-                      <a className="mb-btn ghost" style={{ textDecoration: "none", opacity: syncLink && m.phone ? 1 : 0.45, pointerEvents: syncLink && m.phone ? "auto" : "none" }}
-                        href={syncLink && m.phone ? smsHref(m.phone) : undefined}>Text update</a>
+                      <button className="mb-btn ghost" disabled={sending === m.memberId || !m.publicKey || !updateSize} onClick={async () => {
+                        setSending(m.memberId);
+                        try { setSent(await onEmailUpdate(m)); } finally { setSending(""); }
+                      }}>{sending === m.memberId ? "Preparing…" : !m.publicKey ? "No key yet" : m.email ? "Email update" : "Send update"}</button>
                       <button className="mb-btn ghost" disabled={!syncLink} onClick={() => copy(m.memberId, syncLink)}>{copied === m.memberId ? "Copied" : "Copy link"}</button>
                     </div>
                   )}
@@ -1716,28 +1955,30 @@ function StorageView({ config, setConfig, adapter, sync, state, pending, conflic
 
             {invite && (
               <div className="mb-note good" style={{ marginTop: 10 }}>
-                Invite ready for <strong>{invite.name || invite.phone}</strong>. Their code is <code>{invite.code}</code> — send it too, in case the phone shortens the link.
+                Invite ready for <strong>{invite.name || invite.email}</strong>. Their code is <code>{invite.code}</code> — it goes in the email body along with the join link. Nothing else does; there's no key to encrypt to yet.
                 <div className="mb-two" style={{ marginTop: 8 }}>
-                  <a className="mb-btn ghost" style={{ textDecoration: "none", opacity: invite.phone ? 1 : 0.45, pointerEvents: invite.phone ? "auto" : "none" }}
-                    href={invite.phone ? inviteHref(invite) : undefined}>Text invite</a>
-                  <button className="mb-btn ghost" onClick={() => copy("invite", invite.url)}>{copied === "invite" ? "Copied" : "Copy invite link"}</button>
+                  <button className="mb-btn ghost" disabled={sending === "invite"} onClick={async () => {
+                    setSending("invite");
+                    try { setSent(await onEmailUpdate(invite, true)); } finally { setSending(""); }
+                  }}>{sending === "invite" ? "Preparing…" : "Email invite"}</button>
+                  <button className="mb-btn ghost" onClick={() => copy("invite", invite.joinUrl)}>{copied === "invite" ? "Copied" : "Copy join link"}</button>
                 </div>
               </div>
             )}
 
             <div className="mb-two" style={{ marginTop: 10 }}>
               <input className="mb-input" placeholder="Name" value={newContact.name} onChange={(e) => setNewContact({ ...newContact, name: e.target.value })} />
-              <input className="mb-input" type="tel" placeholder="+15550100" value={newContact.phone} onChange={(e) => setNewContact({ ...newContact, phone: e.target.value })} />
+              <input className="mb-input" type="email" placeholder="them@example.com" value={newContact.email} onChange={(e) => setNewContact({ ...newContact, email: e.target.value })} />
             </div>
-            <button className="mb-btn ghost" style={{ width: "100%", marginTop: 8 }} disabled={!newContact.phone.trim() || !config.p2pPassphrase || inviteBusy}
+            <button className="mb-btn ghost" style={{ width: "100%", marginTop: 8 }} disabled={!newContact.email.trim() || !config.p2pMemberId || inviteBusy}
               onClick={() => showInvite(async () => {
                 const inv = await onInvite(newContact);
-                if (inv) setNewContact({ name: "", phone: "" });
+                if (inv) setNewContact({ name: "", email: "" });
                 return inv;
-              })}>{inviteBusy ? "Building invite…" : "Invite by text"}</button>
+              })}>{inviteBusy ? "Building invite…" : "Invite by email"}</button>
             <div className="mb-note" style={{ marginTop: 12, marginBottom: 0 }}>
-              A confirmed code only shows that whoever opened the link received the text you sent to that number. It is not proof of who owns the phone, and it is not what keeps the plan private — the passphrase is, and anyone who has it can join without an invite at all. Taking someone off the roster does not revoke anything either: they keep the passphrase and their copy of the plan.
-              {" "}“Needs update” means their last acknowledgement is older than your newest edit. Acknowledgements travel with the plan, so they arrive whenever that person next sends something to somebody — soon, but never instantly and never guaranteed. Long plans make long links, and some phones shorten a message that runs past their limit; if a link will not open, use <strong>Copy link</strong> and paste it into a chat app instead.
+              A confirmed code only shows that whoever opened the link received the email you sent to that address — it is not proof of who owns the mailbox. What actually keeps the plan private is that every update is encrypted separately to each person's own key: taking someone off the roster stops them appearing in future recipients, so anything sent after that point they genuinely can't open. What they already received before removal, they still have — no removal after the fact can reach into a copy that already landed.
+              {" "}“Needs update” means their last acknowledgement is older than your newest edit. Acknowledgements travel with the plan, so they arrive whenever that person next sends something to somebody — soon, but never instantly and never guaranteed. The plan travels as an attached file rather than a link, because a text message clips anything past about 1,500 characters and a plan outgrows that quickly. On a phone the share sheet puts the file straight into a mail draft; elsewhere it downloads and a draft opens beside it to attach by hand. Email is slower than a live connection and a filter may hold an unfamiliar attachment, so treat it as the fallback for when nobody is online — not as the fast path.
             </div>
           </div>
         </>
@@ -1838,7 +2079,7 @@ function sampleState(base) {
 /* App                                                                */
 /* ================================================================== */
 
-const defaultConfig = { target: "local", clientId: "", pickerApiKey: "", folderName: "Mealboard", driveFolderId: "", httpBase: "", httpToken: "", httpUser: "", httpPass: "", p2pPassphrase: "", p2pMemberId: "", autoSync: true };
+const defaultConfig = { target: "local", clientId: "", pickerApiKey: "", folderName: "Mealboard", driveFolderId: "", httpBase: "", httpToken: "", httpUser: "", httpPass: "", p2pPassphrase: "", p2pMemberId: "", p2pInviteCode: "", autoSync: true };
 
 export default function App() {
   /* Layer 1 — the live copy. Seeded synchronously from layer 2. */
@@ -1962,8 +2203,11 @@ export default function App() {
   /* --- peer-to-peer: live peers, the outgoing link, the incoming one --- */
   const [p2pPeers, setP2pPeers] = useState(0);
   const [syncLink, setSyncLink] = useState("");
+  const [updateSize, setUpdateSize] = useState(0);
   const [inbound, setInbound] = useState("");
   const [parkedInvite, setParkedInvite] = useState(null);
+  const [parkedReply, setParkedReply] = useState(null);
+  const updateBytesRef = useRef(null);
 
   const lastEdit = useMemo(() => maxUpdatedAt(state), [state]);
   const others = useMemo(
@@ -1975,6 +2219,7 @@ export default function App() {
     [others, lastEdit]
   );
   const nudge = config.target === "p2p" && missing.length > 0;
+  const owesReply = config.target === "p2p" && roster[config.p2pMemberId]?.status === "pending";
 
   /* The adapter mutates its peer count outside React; poll rather than
      invent an event contract for one target. */
@@ -1999,18 +2244,31 @@ export default function App() {
     return () => clearInterval(t);
   }, [config.target, setRoster]);
 
-  /* Every link is a whole encrypted snapshot, so it is rebuilt whenever the
-     plan changes — debounced, and only while someone is there to send it to. */
+  /* Every link and file is a whole encrypted snapshot, so it is rebuilt
+     whenever the plan changes — debounced, and only once this device has
+     claimed an identity to encrypt as. Recipients who have no key yet
+     (an invite still awaiting its reply) just don't get a wrapped copy;
+     the container tolerates that, they simply can't open this one. */
   useEffect(() => {
-    if (config.target !== "p2p" || !config.p2pPassphrase || others.length === 0) { setSyncLink(""); return; }
+    if (config.target !== "p2p" || !config.p2pMemberId || others.length === 0) {
+      setSyncLink(""); setUpdateSize(0); updateBytesRef.current = null; return;
+    }
     let live = true;
     const t = setTimeout(() => {
-      buildSyncLink(config.p2pPassphrase, stateRef.current, rosterRef.current)
-        .then((u) => { if (live) setSyncLink(u); })
-        .catch(() => { if (live) setSyncLink(""); });
+      buildUpdateBytes(stateRef.current, rosterRef.current)
+        .then((b) => {
+          if (!live) return;
+          /* Held here so the send handlers can stay synchronous: the share
+             sheet and mailto: both need the click's gesture, which does not
+             survive an await. */
+          updateBytesRef.current = b;
+          setUpdateSize(b.length);
+          setSyncLink(`${window.location.origin}${window.location.pathname}?sync=${base64url(b)}`);
+        })
+        .catch(() => { if (live) { setSyncLink(""); setUpdateSize(0); updateBytesRef.current = null; } });
     }, 800);
     return () => { live = false; clearTimeout(t); };
-  }, [config.target, config.p2pPassphrase, others.length, state, roster]);
+  }, [config.target, config.p2pMemberId, others.length, state, roster]);
 
   useEffect(() => {
     if (!nudge) return;
@@ -2022,64 +2280,120 @@ export default function App() {
   useEffect(() => {
     const q = new URLSearchParams(window.location.search);
     const payload = q.get("sync"), iid = q.get("iid"), code = q.get("code");
+    const rid = q.get("rid"), pk = q.get("pk"), rname = q.get("rname");
     if (payload) setInbound(payload);
-    /* Invite params travel in the clear: meaningless without the encrypted
-       payload beside them, and without the passphrase that opens it. */
+    /* A join link carries no plan data — nothing to protect — so it needs
+       no key to open. A reply link carries a public key back, which isn't
+       a secret either; the code beside it is what proves it's genuine. */
     if (iid && code) setParkedInvite({ iid, code });
+    if (rid && code && pk) setParkedReply({ rid, code, pk, rname: rname || "" });
   }, []);
 
+  /* Someone replying to an invite: stamp their key onto the entry we
+     already hold for them and mark it confirmed. Pure roster arithmetic —
+     no decryption, so nothing here needs this device to have an identity
+     of its own yet. */
+  useEffect(() => {
+    if (!parkedReply) return;
+    const res = confirmReply(rosterRef.current, parkedReply.rid, parkedReply.code, parkedReply.pk);
+    if (res.ok) {
+      let merged = res.roster;
+      if (parkedReply.rname && !merged[parkedReply.rid].name) {
+        merged = { ...merged, [parkedReply.rid]: { ...merged[parkedReply.rid], name: parkedReply.rname } };
+      }
+      setRoster(merged);
+      rosterRef.current = merged;
+      setView("storage");
+      setError("");
+    } else {
+      setView("storage");
+      setError(res.reason);
+    }
+    setParkedReply(null);
+    window.history.replaceState(null, "", window.location.pathname + window.location.hash);
+  }, [parkedReply, setRoster]);
+
   /* An inbound link is just one more remote snapshot — reconciled, never
-     applied blind. The query param stays in the address bar until it has
-     actually been applied, so a recipient who has not set the passphrase
-     yet does not lose the update by opening it. */
+     applied blind. A join link with no prior roster entry claims the
+     identity provisionally (this device's own key is real even before
+     anyone else has seen it) and stays parked until a reply and a fresh
+     update converge to confirm it for real. */
   useEffect(() => {
     if (!inbound && !parkedInvite) return;
-    if (!config.p2pPassphrase) {
-      setView("storage");
-      setError("This link carries a shared plan update. Pick Peer-to-peer below and enter the passphrase it was encrypted with — the update is applied as soon as it matches.");
-      return;
-    }
     let live = true;
     (async () => {
       try {
-        let merged = rosterRef.current, seen = stateRef.current;
-        if (inbound) {
-          const { state: remote, roster: incoming } = await decodeSyncState(config.p2pPassphrase, inbound);
-          if (!live) return;
-          merged = mergeRosters(merged, incoming);
-          const r = reconcile(baseline.current, clone(stateRef.current), remote);
-          commitReconciled(r, false);
-          seen = r.merged;
-        }
-        let mine = config.p2pMemberId;
+        const { privateKey, publicKey } = await loadDeviceKeyPair();
+        const myKey = await publicKeyB64(publicKey);
+
+        let merged = rosterRef.current, seen = stateRef.current, mine = config.p2pMemberId;
+
         if (parkedInvite) {
-          const res = resolveInvite(merged, parkedInvite.iid, parkedInvite.code);
+          const res = resolveInvite(merged, parkedInvite.iid, parkedInvite.code, myKey);
           if (res.ok) {
             merged = res.roster;
             mine = res.memberId;
             if (res.memberId !== config.p2pMemberId) {
               memberIdRef.current = res.memberId;
-              setConfig({ ...config, p2pMemberId: res.memberId });
+              /* A join link is opened cold, before this device has ever
+                 picked a data source — without switching to it here, the
+                 whole roster/update-file UI stays hidden behind the target
+                 picker and the identity just claimed would be unreachable. */
+              setConfig({ ...config, target: "p2p", p2pMemberId: res.memberId });
             }
+            setParkedInvite(null);
+            setView("storage");
+          } else if (res.unknown) {
+            const t = now();
+            merged = { ...merged, [parkedInvite.iid]: memberEntry({
+              memberId: parkedInvite.iid, status: "pending", inviteCode: parkedInvite.code,
+              publicKey: myKey, provisional: true, invitedAt: t, updatedAt: t,
+            }) };
+            mine = parkedInvite.iid;
+            memberIdRef.current = parkedInvite.iid;
+            /* Kept in config, not just React state: without this a reload
+               loses the code, and the reply link can never be rebuilt. */
+            setConfig({ ...config, target: "p2p", p2pMemberId: parkedInvite.iid, p2pInviteCode: parkedInvite.code });
+            setView("storage");
           } else {
             setView("storage");
             setError(res.reason);
+            setParkedInvite(null);
           }
-          setParkedInvite(null);
         }
+
+        /* Committed here, before the inbound file is even attempted: a
+           provisional identity has to survive a decode failure below (an
+           update that arrived alongside a join link but wasn't wrapped for
+           this device yet is an expected first-contact case, not a reason
+           to forget who this device just decided it is). */
         setRoster(merged);
         rosterRef.current = merged;
+
+        if (inbound) {
+          const { state: remote, roster: incoming } = await readUpdateBytes(privateKey, mine, unbase64url(inbound));
+          if (!live) return;
+          merged = mergeRosters(merged, incoming);
+          setRoster(merged);
+          rosterRef.current = merged;
+          const r = reconcile(baseline.current, clone(stateRef.current), remote);
+          commitReconciled(r, false);
+          seen = r.merged;
+        }
+
         noteSelfSeen(setRoster, mine, seen);
         setInbound("");
         window.history.replaceState(null, "", window.location.pathname + window.location.hash);
-      } catch {
+      } catch (e) {
         if (!live) return;
         setView("storage");
-        setError("That update link could not be opened. Check the passphrase matches the sender's exactly, and that the whole link arrived unbroken.");
+        setError(e.message || "That update file could not be opened — it may not have been encrypted for this device, or the link arrived broken.");
+        setInbound("");
+        window.history.replaceState(null, "", window.location.pathname + window.location.hash);
       }
     })();
     return () => { live = false; };
-  }, [inbound, parkedInvite, config.target, config.p2pPassphrase, config.p2pMemberId, commitReconciled, setRoster]);
+  }, [inbound, parkedInvite, config.target, config.p2pMemberId, commitReconciled, setRoster]);
 
   const connect = async () => {
     setError(""); setSync((s) => ({ ...s, status: "busy" }));
@@ -2096,13 +2410,16 @@ export default function App() {
 
       /* Anyone in the room belongs on the roster, invited or not — the
          passphrase is what let them in, so the creator and anyone who was
-         simply told the words both register themselves here. An invitee is
-         the one exception: the id they confirm was minted by the inviter. */
+         simply told the words both register themselves here, stamped with
+         this device's own public key right away. An invitee is the one
+         exception: the id they confirm was minted by the inviter, and their
+         key arrives through the invite/reply handshake instead. */
       if (adapterRef.current.writeRoster) {
         let next = rosterRef.current;
         if (!config.p2pMemberId && !parkedInvite) {
+          const { publicKey } = await loadDeviceKeyPair();
           const memberId = uid(), t = now();
-          next = { ...next, [memberId]: memberEntry({ memberId, status: "confirmed", invitedAt: t, confirmedAt: t, updatedAt: t }) };
+          next = { ...next, [memberId]: memberEntry({ memberId, status: "confirmed", publicKey: await publicKeyB64(publicKey), invitedAt: t, confirmedAt: t, updatedAt: t }) };
           setRoster(next);
           rosterRef.current = next;
           memberIdRef.current = memberId;
@@ -2120,49 +2437,167 @@ export default function App() {
 
   const disconnect = () => { adapterRef.current?.disconnect?.(); setSync({ status: "idle", at: 0 }); setConflicts([]); };
 
-  /* Built here, not from the debounced link above, so the invite that was
-     just written is certain to be inside the payload the invitee opens. */
-  const inviteLink = async (entry, snapshot) => {
+  /* Deliberately NOT async before the share sheet fires. Chrome treats the
+     share sheet and an external-protocol navigation as gesture-gated, and a
+     gesture does not survive an await — building the payload here instead of
+     ahead of time got the mail draft silently dropped on desktop and the
+     share sheet refused outright on a phone, while the UI still claimed a
+     draft had opened. The bytes are prepared by the debounced effect above. */
+  const emailUpdate = (member, isInvite) => {
+    if (isInvite) {
+      window.location.href = mailtoLink(member.email, INVITE_SUBJECT, inviteBody(member.name, member.joinUrl, member.code));
+      return Promise.resolve("Mail draft opened — send it to finish inviting them.");
+    }
+    const bytes = updateBytesRef.current;
+    if (!bytes) {
+      setError("The update is still being prepared — give it a moment and press it again.");
+      return Promise.resolve("");
+    }
+    const to = member?.email || "";
+    return shareUpdate(bytes, { to, subject: UPDATE_SUBJECT, body: updateBody(member?.name) })
+      .then((how) => {
+        if (how === "cancelled") return "";
+        if (how === "shared") return "Handed to your share sheet. Pick the mail app and send it.";
+        return to
+          ? "Update file downloaded and a draft opened. Attach the file to the draft before sending — mail links cannot carry an attachment by themselves."
+          : "Update file downloaded. Attach it to an email, or hand it over however you like.";
+      })
+      .catch((e) => { setError(e.message || String(e)); return ""; });
+  };
+
+  /* The other side of the invite handshake: this device's own reply,
+     carrying its public key back to whoever invited it. No attachment, no
+     encryption — the code is what makes it trustworthy, same as an invite.
+     Precomputed into replyUrl below, so pressing it is one synchronous hop
+     and the gesture survives (see emailUpdate). */
+  const replyUrl = useMemo(() => {
+    const mine = roster[config.p2pMemberId];
+    if (!mine || mine.status !== "pending") return "";
+    const code = mine.inviteCode || config.p2pInviteCode;
+    if (!code || !mine.publicKey) return "";
+    const loc = window.location;
+    return `${loc.origin}${loc.pathname}?rid=${mine.memberId}&code=${code}&pk=${mine.publicKey}${mine.name ? `&rname=${encodeURIComponent(mine.name)}` : ""}`;
+  }, [roster, config.p2pMemberId, config.p2pInviteCode]);
+
+  const emailReply = () => {
+    if (!replyUrl) { setError("This device has no invite code to reply with. Ask for a fresh invite link."); return Promise.resolve(""); }
+    window.location.href = mailtoLink("", REPLY_SUBJECT, replyBody(replyUrl));
+    return Promise.resolve("Reply draft opened — send it back to whoever invited you.");
+  };
+
+  /* Taking a place on the roster is just minting an id and publishing this
+     device's public key — none of which needs a passphrase or a live
+     connection. Requiring Start for it forced anyone who only ever wanted
+     the email transport to invent a WebRTC passphrase and dial a signalling
+     server they would never use. */
+  const claimIdentity = async () => {
+    if (config.p2pMemberId) return;
     try {
-      const link = await buildSyncLink(config.p2pPassphrase, stateRef.current, snapshot || rosterRef.current);
-      return { memberId: entry.memberId, name: entry.name, phone: entry.phone, code: entry.inviteCode, url: `${link}&iid=${entry.memberId}&code=${entry.inviteCode}` };
+      const { publicKey } = await loadDeviceKeyPair();
+      const memberId = uid(), t = now();
+      const next = { ...rosterRef.current, [memberId]: memberEntry({
+        memberId, status: "confirmed", publicKey: await publicKeyB64(publicKey),
+        invitedAt: t, confirmedAt: t, updatedAt: t,
+      }) };
+      setRoster(next);
+      rosterRef.current = next;
+      memberIdRef.current = memberId;
+      setConfig({ ...config, p2pMemberId: memberId });
+      setError("");
     } catch (e) {
       setError(e.message || String(e));
-      return null;
     }
   };
 
-  const createInvite = async ({ name, phone }) => {
-    if (!config.p2pPassphrase) { setError("Set the shared passphrase before inviting anyone."); return null; }
+  /* An attachment is one more remote snapshot: reconciled against the same
+     baseline as everything else, never applied over the top. */
+  const importUpdate = async (file) => {
+    try {
+      const { privateKey, publicKey } = await loadDeviceKeyPair();
+      const myKey = await publicKeyB64(publicKey);
+      let mine = config.p2pMemberId, merged = rosterRef.current;
+
+      if (parkedInvite) {
+        const res = resolveInvite(merged, parkedInvite.iid, parkedInvite.code, myKey);
+        if (res.ok) {
+          merged = res.roster;
+          mine = res.memberId;
+          if (res.memberId !== config.p2pMemberId) {
+            memberIdRef.current = res.memberId;
+            setConfig({ ...config, p2pMemberId: res.memberId });
+          }
+          setParkedInvite(null);
+        } else if (!res.unknown) {
+          setError(res.reason);
+          setParkedInvite(null);
+        }
+      }
+      if (!mine) { setError("Press Start above once to take your place on the roster, then open the file again."); return ""; }
+
+      const { state: remote, roster: incoming } = await readUpdateBytes(privateKey, mine, await file.arrayBuffer());
+      merged = mergeRosters(merged, incoming);
+      const r = reconcile(baseline.current, clone(stateRef.current), remote);
+      commitReconciled(r, false);
+
+      setRoster(merged);
+      rosterRef.current = merged;
+      noteSelfSeen(setRoster, mine, r.merged);
+      setError("");
+      const n = r.fromRemote;
+      return n > 0
+        ? `Merged ${n} change${n === 1 ? "" : "s"} from that file.`
+        : "Opened — nothing in that file was newer than what you already have.";
+    } catch (e) {
+      setError(e.message || "That file could not be opened — it may not have been encrypted for this device.");
+      return "";
+    }
+  };
+
+  /* Built here, not from the debounced link above, so the invite that was
+     just written is certain to be inside the payload the invitee opens. */
+  const inviteLink = async (entry) => {
+    const loc = window.location;
+    return {
+      memberId: entry.memberId, name: entry.name, email: entry.email, code: entry.inviteCode,
+      joinUrl: `${loc.origin}${loc.pathname}?iid=${entry.memberId}&code=${entry.inviteCode}`,
+      isInvite: true,
+    };
+  };
+
+  const createInvite = async ({ name, email }) => {
+    if (!config.p2pMemberId) { setError("Press Start above once to take your own place on the roster before inviting anyone."); return null; }
     const t = now();
     const entry = memberEntry({
-      memberId: uid(), name: (name || "").trim(), phone: (phone || "").trim(),
+      memberId: uid(), name: (name || "").trim(), email: (email || "").trim(),
       status: "pending", inviteCode: inviteCode(), invitedBy: config.p2pMemberId || "", invitedAt: t, updatedAt: t,
     });
     const next = { ...rosterRef.current, [entry.memberId]: entry };
     setRoster(next);
     rosterRef.current = next;
-    return inviteLink(entry, next);
+    return inviteLink(entry);
   };
 
   /* The self entry is minted blank on connect (see above) — nothing ever
      prompted the creator, or anyone who joined on the bare passphrase, for
      their own name or number, so they sat on the roster forever as
      "Unnamed" with no way for anyone else to text them. */
-  const updateSelf = ({ name, phone }) => {
+  const updateSelf = ({ name, email }) => {
     const memberId = config.p2pMemberId;
     if (!memberId) return;
     setRoster((r) => {
       const mine = r[memberId];
       if (!mine) return r;
-      const n = (name ?? mine.name ?? "").trim(), p = (phone ?? mine.phone ?? "").trim();
-      if (mine.name === n && mine.phone === p) return r;
-      return { ...r, [memberId]: { ...mine, name: n, phone: p, updatedAt: now() } };
+      const n = (name ?? mine.name ?? "").trim(), em = (email ?? mine.email ?? "").trim();
+      if (mine.name === n && mine.email === em) return r;
+      return { ...r, [memberId]: { ...mine, name: n, email: em, updatedAt: now() } };
     });
   };
 
   /* A tombstone, not a removal: a deleted key would simply come back on the
-     next merge. It revokes nothing — they still have the passphrase. */
+     next merge. This only ever runs on a still-pending invite, so it's a
+     real revocation — nothing was ever encrypted to a key they didn't have
+     yet, and the recipient filter in buildUpdateBytes excludes cancelled
+     entries from here on regardless of whether one landed by chance. */
   const cancelInvite = (memberId) => setRoster((r) => {
     const e = r[memberId];
     if (!e) return r;
@@ -2312,7 +2747,22 @@ export default function App() {
           </div>
         </header>
 
-        {nudge && view !== "storage" && (
+        {/* The invitee's half of the handshake is the one pending action a
+            new arrival cannot guess at: until their key gets back, nothing
+            can be encrypted to them and no plan will ever arrive. It lived
+            only inside Storage, so closing the tab hid it completely. */}
+        {owesReply && view !== "storage" && (
+          <div className="mb-view">
+            <div className="mb-note" style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 0 }}>
+              <span style={{ flex: 1 }}>
+                You've been invited to a plan, but your key hasn't gone back yet — until it does, nothing can be sent to you.
+              </span>
+              <button className="mb-btn" style={{ padding: "6px 12px", fontSize: 12.5, flex: "none" }} onClick={() => setView("storage")}>Send my key</button>
+            </div>
+          </div>
+        )}
+
+        {nudge && !owesReply && view !== "storage" && (
           <div className="mb-view">
             <div className="mb-note" style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 0 }}>
               <span style={{ flex: 1 }}>
@@ -2332,8 +2782,9 @@ export default function App() {
         {view === "ingredients" && <IngredientsView ingredients={ingredients} stock={state.stock} entriesAll={entriesAll} d={d} open={open} toggle={toggle} goto={goto} updateIng={updateIng} deleteIng={deleteIng} addIng={addIng} />}
         {view === "storage" && (
           <StorageView config={config} setConfig={setConfig} adapter={adapterRef.current} sync={sync} state={state}
-            pending={pending} conflicts={conflicts} error={error} p2pPeers={p2pPeers} syncLink={syncLink}
+            pending={pending} conflicts={conflicts} error={error} p2pPeers={p2pPeers} syncLink={syncLink} updateSize={updateSize}
             roster={roster} missing={missing} onInvite={createInvite} onInviteLink={inviteLink} onCancelInvite={cancelInvite} onUpdateSelf={updateSelf}
+            onEmailUpdate={emailUpdate} onImportUpdate={importUpdate} onEmailReply={emailReply} onClaimIdentity={claimIdentity} replyUrl={replyUrl}
             onConnect={connect} onDisconnect={disconnect} onJoinDrive={joinDrive} onLeaveDrive={leaveDriveFolder} onSync={() => runSync(false)}
             onShare={(on) => adapterRef.current.share?.(on).catch((e) => setError(e.message))}
             onWipeCache={wipeCache} />

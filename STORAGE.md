@@ -197,3 +197,74 @@ device had not seen yet, and would resurrect on the next sync.
 
 Switching targets does not migrate data. Export the CSVs from the old target
 and drop them into the new one if you need to carry the plan across.
+
+
+## The email transport
+
+When nobody is online at the same time, the plan travels by email as an
+encrypted attachment.
+
+It does not travel as a link. A text message clips anything past roughly 1,500
+characters and phones do it silently, so a plan of any size could never be
+relied on to arrive that way. `mailto:` cannot rescue that either — RFC 6068
+defines no attachment field, so a link alone can never carry a file.
+
+So the file is built in the page and handed to the OS share sheet
+(`navigator.share` with a `File`), which is what actually drops it into a mail
+draft on a phone. Where the share sheet is unavailable — most desktop browsers
+— the file downloads and a pre-addressed draft opens beside it to attach by
+hand. The UI says which of the two just happened rather than claiming an email
+was sent.
+
+### The container
+
+    "MBUP2" | ephemeral ECDH pubkey (65 bytes) | recipient count (1 byte)
+    recipients[]: memberId length (1) + memberId + wrap IV (12) + wrap cipher (48)
+    main IV (12 bytes) | AES-GCM ciphertext
+
+The plaintext is a Yjs document update carrying the same tables and the roster.
+It's encrypted once with a random content key, which is then wrapped
+separately for every active roster member who has a public key — ECDH
+(P-256) between a fresh ephemeral keypair and each recipient's key, HKDF-SHA256
+salted with their memberId, AES-256-GCM. Each device keeps its own keypair
+(generated once, held only in that browser's cache) and only that keypair
+opens the wraps addressed to it. The room passphrase plays no part in this —
+it's still what lets peers find each other on WebRTC, nothing more — so
+removing someone from the roster genuinely stops them being a recipient of
+anything encrypted afterward, rather than only looking like it stops them.
+
+### On receipt
+
+`Storage → Open update file`. The attachment is treated as one more remote
+snapshot: reconciled three-way against the same baseline as every other
+target, never applied over the top. Applying the same file twice changes
+nothing, which is what makes a transport with no acknowledgement workable.
+
+### Invites: a two-step handshake
+
+A key nobody has yet can't be encrypted to, so a brand-new member needs one
+plain round trip before any plan data can reach them:
+
+1. The join link (`?iid=…&code=…`) carries no plan data — nothing to
+   protect — so it needs no key to open.
+2. Opening it generates the invitee's device keypair and offers a reply link
+   (`?rid=…&code=…&pk=…`) to send back. The public key travels in the clear;
+   it isn't a secret, and the invite code is what proves the reply is
+   genuine.
+3. Once the inviter opens that reply, the invitee's key is on the roster and
+   future updates can be wrapped for them. Both links are short enough to
+   sit directly in an email body — the round trip carries no attachment.
+
+Until step 3, the invitee shows on their own device as a provisional,
+unconfirmed member of themselves; any update or roster it hasn't reached yet
+just doesn't have them in the recipient list.
+
+### What this does not fix
+
+Email is store-and-forward, so delivery is minutes, not seconds — it is the
+fallback for when nobody is online, not the fast path. A spam filter may hold
+an unfamiliar binary attachment. The payload is the whole plan every time and
+grows as history accumulates. Revocation is real going forward — a removed
+member gets no further wraps — but it isn't retroactive: anything already
+decrypted before removal stays readable in that copy, the way it would with
+any transport.

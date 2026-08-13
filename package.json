@@ -1,0 +1,22 @@
+{
+  "name": "mealboard",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Collaborative meal calendar and merged grocery list",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "dependencies": {
+    "jsqr": "1.4.0",
+    "qrcode-generator": "1.4.4",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "y-webrtc": "10.3.0",
+    "yjs": "13.6.20"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.0"
+  }
+}
